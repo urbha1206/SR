@@ -1,1 +1,1584 @@
+-- Databricks notebook source
+-- MAGIC %md
+-- MAGIC ### UNIFIED INDIVIDUAL SCD
+-- MAGIC - Unified Identity scd will have change history by hour.
+-- MAGIC - Data to be refreshed every hour.  Even if the job is delayed by multiple hours, change history should be created hourly.
+-- MAGIC - Data updated within the hour, will be made valid from beginning of the hour.
+-- MAGIC   - Ex: if identity email updated at 2024-10-10 3:15PM EST, the update will be available in change history with valid_from_est_timestamp = '2024-10-10 15:00:00.000'
+-- MAGIC - These SCD STG tables will track only what needed for unified_identity_scd
+-- MAGIC   - identity: email address, phone number
+-- MAGIC   - billing profile: first name, last name, service address
+-- MAGIC   - household link: individual id, household id
+-- MAGIC   - subscription: owner, state, source(billing platform)
+-- MAGIC - Late arriving events are excluded in this scope. (define late arriving events: TBD)
+-- MAGIC - SCD is tracked using envelope time.
+-- MAGIC - Source dimensions also should be refreshed hourly to maintain data integerity across connected curated tables.
+-- MAGIC   - identity_dim
+-- MAGIC   - subscription_scd (new)
+-- MAGIC
+-- MAGIC   
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC **Implementation**
+-- MAGIC
+-- MAGIC **Prepare delta staging**: 
+-- MAGIC - identity_scd_stg, billingprofile_scd_stg, household_link_scd_stg, subscription_scd_stg.
+-- MAGIC - Updates with no changes compared to prior update will be excluded. (1st delta will be checked for changes during merge staging)
+-- MAGIC - valid_from & valid to
+-- MAGIC   - valid_from: delta timestamp
+-- MAGIC   - valid_to : next record delta timestamp, if not available, use 9999-12-31
+-- MAGIC - billing_profile_scd_stg
+-- MAGIC   - delta history is prepared with identityId and delta-timestamp as key.  If there are multiple billing profiles for same identity updated with same timestamp, only one billing profile update is taken based on latest envelope time and not-deleted billing profile.
+-- MAGIC
+-- MAGIC **unified_identity_stg**
+-- MAGIC
+-- MAGIC **delta scd hour list** : 
+-- MAGIC - Prepare the distinct list of date-hour from all delta stg tables
+-- MAGIC - For each date-hour, join identity, billing profile, household link, legacy sub data.
+-- MAGIC
+-- MAGIC **Derive Individual Id source based on delta** : 
+-- MAGIC - If billing profile exists and atlas individual id is available then 'atlas-stripe'
+-- MAGIC - Elseif has subscriptions with source = (sms, charon, internal) and the subscription is found in legacy with Individual Id , then 'legacy'
+-- MAGIC - Elseif has subscriptions with source = (sms, charon, internal) and the subscription is found in legacy without Individual Id , then 'legacy-account' 
+-- MAGIC - Elseif 'atlas-identity'
+-- MAGIC
+-- MAGIC **Merge and Mint person ids for Delta Individual Ids** : 
+-- MAGIC   - atlas-stripe: If the individual id already exists in person from legacy, overwrite with Atlas data since Atlas takes precedence.
+-- MAGIC   - For 'atlas-identity' identities, person record will be created using missing_individual_id_struct.identity_id
+-- MAGIC   - For 'legacy-account' identities, person record will be created using missing_individual_id_struct.legacy_account_id
+-- MAGIC
+-- MAGIC **Merge into unified_identity_stg** into unified_identity_scd using identity_id, valid_from_est_timestamp and valid_to_est_timestamp
+-- MAGIC
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Open items:
+-- MAGIC 1. Delta process and how to merge
+-- MAGIC 2. Track party merge in both Atlas and Legacy
+-- MAGIC 3. Convert person_dim to person_scd
+-- MAGIC 4. Add country code to unified_identity_scd
+-- MAGIC
+-- MAGIC
+-- MAGIC Resolved:
+-- MAGIC 1. _Update prior person id struct_ (V2)
+-- MAGIC 2. _Improve atlas sub stg process - to reduce the delta if possible_ (V2)
+-- MAGIC 3. _Track changes from legacy sub for individual id change for account_ (V2)
+-- MAGIC 4. _Add Is Primary flag to unified identity scd (need to update non-delta identities after UI merge from delta)_ (V2)
+-- MAGIC 5. _Add Primary Identity, Account in Person_ (V2)
+-- MAGIC 6. _Primary Identity - should be based on latest update timestamp - currently create timestamp is used._ (V2)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC **Change History**
+-- MAGIC
+-- MAGIC | Version | Change Date | Change | Change Details | Notebook Status |
+-- MAGIC | -------- |  --------  |  --------  |  --------  |  --------  |
+-- MAGIC | V1 | 10/11/2024 | Initial Version |  |Released |
+-- MAGIC | V2 | 10/16/2024 | Add Primary Identity, Account in Person|missing_individual_id_struct is removed and new fields primary_identity_id, primary_legacy_account_id added.| Released |
+-- MAGIC | V2 | 10/16/2024 | Improve atlas sub stg process| Changed partition class to track only individual id and account id.  Rename unified_identity_metadata_struct to additional_info_struct. Struct elements are also changed. | Released |
+-- MAGIC | V2 | 10/16/2024 | Track changes from legacy sub for individual id change for account| Use legacy vehicle_device_dim as primary source instead of atlas subscription. | Released |
+-- MAGIC | V2 | 10/16/2024 | Add Is Primary flag to unified identity scd | Will be updated to Y for identity/account used to update person | Released |
+-- MAGIC | V2 | 10/16/2024 | Add legacy accounts into UI SCD |  | Released |
+-- MAGIC | V3 |  | Delta process and Merge |Delta process using variables: v_from_ts, v_to_ts; Same delta process can be used for Initial Load.| In Progress |
+-- MAGIC | V3 |  | Convert person_dim to person_scd |Change the person load process to cover SCD| In Progress |
+-- MAGIC
+-- MAGIC
+
+-- COMMAND ----------
+
+-- DBTITLE 1,table definition: person_dim
+drop table if exists  sandbox_prod.sbosco.person_dim;
+create table sandbox_prod.sbosco.person_dim ( 
+person_id string, --DE generated
+source string,
+individual_id string,
+household_id string,
+best_email_address string,
+best_address_struct struct<city:string,
+                          state:string,
+                          zip_code:string,
+                          address_line_1:string, 
+                          address_line_2:string,
+                          country:string>,
+best_first_name string,
+best_last_name string,
+best_phone_number string,
+state string,
+merged_person_id string,
+
+/*** V2 ***/
+primary_identity_id string,
+primary_legacy_account_id string,
+prior_primary_identity_id string,
+prior_primary_legacy_account_id string,
+
+etl_metadata_struct struct<etl_create_est_timestamp: timestamp,
+                           etl_update_est_timestamp: timestamp>
+);
+
+ALTER TABLE sandbox_prod.sbosco.person_dim SET OWNER TO data-architecture;
+
+GRANT SELECT ON TABLE sandbox_prod.sbosco.person_dim TO data-eng;
+
+-- COMMAND ----------
+
+-- DBTITLE 1,table definition: unified_identity_scd
+drop table if exists  sandbox_prod.sbosco.unified_identity_scd;
+create table sandbox_prod.sbosco.unified_identity_scd ( 
+unified_identity_id string, --DE generated
+source string,
+
+legacy_account_id string,
+identity_id string,
+person_id string,
+
+individual_id string, 
+individual_id_source string,  
+
+email_address string,
+address_struct struct<city:string,
+                          state:string,
+                          zip_code:string,
+                          address_line_1:string, 
+                          address_line_2:string,
+                          country:string>,
+first_name string,
+last_name string,
+phone_number string,
+
+is_best_first_name boolean,
+is_best_last_name boolean,
+is_best_email_address boolean,
+is_best_phone_number boolean,
+is_best_address boolean,
+is_primary boolean,
+
+created_est_timestamp timestamp,
+
+valid_from_est_timestamp timestamp,
+valid_to_est_timestamp timestamp,
+is_current boolean,
+is_deleted boolean,
+
+prior_person_struct struct<prior_person_id:string, 
+                           change_est_timestamp:timestamp>,
+                           
+/*** V2 ***/
+additional_info_struct struct<
+billing_profile_id:string,
+subscription_id:string,
+legacy_subscription_id:string,
+identity_valid_from_est_timestamp:timestamp,
+billing_profile_valid_from_est_timestamp:timestamp,
+household_link_valid_from_est_timestamp:timestamp,
+subscription_valid_from_est_timestamp:timestamp,
+is_billing_profile_deleted:boolean,
+is_household_link_deleted:boolean,
+is_subscription_deleted:boolean,
+linked_legacy_account_id:string>,
+                                        
+etl_metadata_struct struct<etl_create_est_timestamp: timestamp,
+                           etl_update_est_timestamp: timestamp>
+------
+
+);
+
+ALTER TABLE sandbox_prod.sbosco.unified_identity_scd SET OWNER TO data-architecture;
+
+GRANT SELECT ON TABLE sandbox_prod.sbosco.unified_identity_scd TO data-eng;
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC **Prepare Delta - stg**
+
+-- COMMAND ----------
+
+/*** V2 ***/
+DROP TEMPORARY VARIABLE if exists v_from_timestamp;
+DECLARE VARIABLE v_from_timestamp TIMESTAMP default '2023-01-01 00:00:00.000'; 
+VALUES (v_from_timestamp); 
+-- v_to_hour from previous run
+-- may need keep different v_from_hour/v_to_hour for each dimension
+DROP TEMPORARY VARIABLE if exists v_to_timestamp;
+DECLARE VARIABLE v_to_timestamp TIMESTAMP default date_trunc('HOUR',current_timestamp);
+VALUES (v_to_timestamp);
+--valid to : truncate to hour is for testing only; no need to truncate to hour: we can use current timestamp (UTC) for prod
+
+-- COMMAND ----------
+
+-- DBTITLE 1,identity_scd_stg
+drop table if exists  sandbox_prod.sbosco.identity_scd_stg;
+create table  sandbox_prod.sbosco.identity_scd_stg
+select
+identityId as identity_id,
+email_address,
+phone_number,
+/*** V2 ***/
+idt_create_est_timestamp,
+idt_update_est_timestamp,
+
+valid_from_date_hour,
+/*** V2 ***/
+coalesce(lead(valid_from_date_hour) OVER (PARTITION BY identityId ORDER BY valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour,
+
+
+case when isDeleted = false and valid_to_date_hour = '9999-12-31 00:00:00.000' then true else false end as is_current,
+isDeleted as is_deleted
+
+from --identify new records or the records with chnages from prior update
+(
+    select identityId, email_address, phone_number, 
+    from_utc_timestamp(createdAt,'GMT-5') as idt_create_est_timestamp, /*** V2 ***/
+    from_utc_timestamp(lastUpdatedAt,'GMT-5') as idt_update_est_timestamp, /*** V2 ***/
+    valid_from_date_hour, isDeleted,
+    case when lag(struct(identityId, email_address, phone_number)) 
+        over(partition by identityId ORDER BY envelopeTime)
+        = struct(identityId, email_address, phone_number) 
+    then false 
+    else true 
+    end as is_new_change
+
+    from 
+    (  --cleansed events deduping multiple updates with same timestamp
+        select * from
+        ( 
+        select identityId, coalesce(handle.emailAddress, contact.emailAddress) as email_address,
+        contact.PhoneNumber as phone_number, createdAt, lastUpdatedAt, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.user_services.identity_created_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select identityId, coalesce(handle.emailAddress, contact.emailAddress) as email_address,
+        contact.PhoneNumber as phone_number, createdAt, lastUpdatedAt, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.user_services.identity_updated_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select identityId, coalesce(handle.emailAddress, contact.emailAddress) as email_address,
+        contact.PhoneNumber as phone_number, createdAt, lastUpdatedAt, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        true as isDeleted from cleansed_prod.user_services.identity_deleted_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        )
+        qualify row_number() over (PARTITION BY identityId, valid_from_date_hour ORDER BY envelopeTime desc, isDeleted desc) = 1
+        --if create/update and delete are with same envelopetime, Deleted event will be taken.
+    ) 
+    
+)
+where is_new_change = true or isDeleted = true;
+
+select count(*) from sandbox_prod.sbosco.identity_scd_stg;
+--124092746
+
+-- COMMAND ----------
+
+select identity_id, count(*) from sandbox_prod.sbosco.identity_scd_stg
+group by 1 having count(*) > 1
+order by 2 desc
+limit 100;
+
+-- COMMAND ----------
+
+-- DBTITLE 1,billing_profile_scd_stg
+drop table if exists  sandbox_prod.sbosco.billing_profile_scd_stg;
+create table  sandbox_prod.sbosco.billing_profile_scd_stg
+select
+id as billing_profile_id,
+identityId as identity_id,
+tenant as tenant_id, 
+billingProfileName.firstAndLastName.firstName as first_name,
+billingProfileName.firstAndLastName.lastName as last_name,
+struct(serviceAddress.city, serviceAddress.state, serviceAddress.zipCode as zip_code, serviceAddress.addressLine1 address_line_1, serviceAddress.addressLine2 as address_line_2,  serviceAddress.country) as service_address_struct,
+
+valid_from_date_hour,
+/*** V2 ***/
+coalesce(lead(valid_from_date_hour) OVER (PARTITION BY identityId ORDER BY valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour,
+
+isDeleted as is_deleted
+
+from --identify new records or the records with chnages from prior update
+(
+    select id, identityId, tenant, billingProfileName, serviceAddress, valid_from_date_hour, isDeleted,
+    case when lag(struct(identityId, tenant, billingProfileName, serviceAddress)) 
+        over(partition by identityId ORDER BY envelopeTime)
+        = struct(identityId, tenant, billingProfileName, serviceAddress) 
+    then false 
+    else true 
+    end as is_new_change
+
+    from 
+    (  --cleansed events deduping multiple updates with same timestamp
+        select * from
+        ( 
+        select id, identityId, tenant, billingProfileName, serviceAddress, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.commerce.billing_profile_created_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select id, identityId, tenant, billingProfileName, serviceAddress, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.commerce.billing_profile_updated_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select id, identityId, tenant, billingProfileName, serviceAddress, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        true as isDeleted from cleansed_prod.commerce.billing_profile_deleted_events
+        where isTest = false
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        )
+        qualify row_number() over (PARTITION BY identityId, valid_from_date_hour ORDER BY envelopeTime desc, isDeleted) = 1
+        --partition by identityid and order by isDeleted because we see 2 billing profiles with same timestamp, one updated and one deleted
+        --multiple billing profiles in sequence is supported, but updating one and deleting another one at the same time, creates issues in later delta merge.
+    ) 
+    
+)
+where is_new_change = true or isDeleted = true;
+
+select count(*) from sandbox_prod.sbosco.billing_profile_scd_stg;
+--3734158
+--3512351
+
+-- COMMAND ----------
+
+select
+case when update_count <= 5 then '<=5'
+     when update_count > 5 and update_count <= 100 then '6-100'
+     else '>100'
+end update_cnt_segment,
+count(*)
+from (
+  select billing_profile_id, count(*) as update_count from sandbox_prod.sbosco.billing_profile_scd_stg
+  group by 1 having count(*) > 1
+)
+group by 1
+order by 2 desc
+limit 100;
+
+-- COMMAND ----------
+
+-- DBTITLE 1,household_link_scd_stg
+drop table if exists  sandbox_prod.sbosco.household_link_scd_stg;
+create table  sandbox_prod.sbosco.household_link_scd_stg
+select
+identityId as identity_id, 
+individualId as individual_id, 
+householdId as household_id,
+
+valid_from_date_hour,
+/*** V2 ***/
+coalesce(lead(valid_from_date_hour) OVER (PARTITION BY identityId ORDER BY valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour,
+
+isDeleted as is_deleted
+
+from --identify new records or the records with chnages from prior update
+(
+    select identityId, individualId, householdId, valid_from_date_hour, isDeleted,
+    case when lag(struct(identityId, individualId, householdId)) 
+        over(partition by identityId ORDER BY envelopeTime)
+        = struct(identityId, individualId, householdId) 
+    then false 
+    else true 
+    end as is_new_change
+
+    from 
+    (  --cleansed events deduping multiple updates with same timestamp
+        select * from
+        ( 
+        select identityId, individualId, householdId, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.user_services.household_link_created_events
+        where isTest = false
+        and individualId is not null and individualId <> '' /*** V2 ***/
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select identityId, individualId, householdId, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.user_services.household_link_updated_events
+        where isTest = false
+        and individualId is not null and individualId <> '' /*** V2 ***/
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select identityId, individualId, householdId, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour,  
+        true as isDeleted from cleansed_prod.user_services.household_link_deleted_events
+        where isTest = false
+        and individualId is not null and individualId <> '' /*** V2 ***/
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        )
+        qualify row_number() over (PARTITION BY identityId, valid_from_date_hour ORDER BY envelopeTime desc, isDeleted desc) = 1
+    ) 
+    
+)
+where is_new_change = true or isDeleted = true;
+
+select count(*) from sandbox_prod.sbosco.household_link_scd_stg;
+--95830525
+
+-- COMMAND ----------
+
+select
+case when update_count <= 5 then '<=5'
+     when update_count > 5 and update_count <= 100 then '6-100'
+     else '>100'
+end update_cnt_segment,
+count(*)
+from (
+  select identity_id, count(*) as update_count from sandbox_prod.sbosco.household_link_scd_stg
+  group by 1 having count(*) > 1
+)
+group by 1
+order by 2 desc
+limit 100;
+
+-- COMMAND ----------
+
+-- DBTITLE 1,legacy_subscription_scd_stg
+/*** 
+/*** V2 ***/
+Delta:
+1. legacy_subscription_scd_stg:
+   Legacy subscriptions can chnage the individual id with no changes in sync's atlas subscriptions.
+   Atlas subscriptions sync from Legacy is real time. But TD legacy subscription data is refreshed once a day.
+   To cover this delay from Legacy, we will check for legacy subscription changes using v_from_timestamp & to_timestamp.
+   Atlas subscriptions will not be checked for any time.
+   
+2. atlas_subscription_scd_stg:
+   In case of atlas subscriptions delay (more than a day), legacy subscriptions might already have been processed.
+   To cover this delay from Atlas, we will check for Atlas subscription changes using v_from_timestamp & to_timestamp.
+   Legacy subscriptions will not be checked for any time
+   
+If possible, you can cover these 2 steps (2 stg tables) into one ***/
+
+drop table if exists  sandbox_prod.sbosco.legacy_subscription_stg;
+drop table if exists  sandbox_prod.sbosco.legacy_subscription_scd_stg;
+create table  sandbox_prod.sbosco.legacy_subscription_scd_stg
+select
+subscription_id, 
+identity_id, 
+source_external_reference, /*** V2 ***/
+individual_id,
+account_id,
+household_id,
+
+valid_from_date_hour, -- should switch to TD vehicle device for production.
+/*** V2 ***/
+coalesce(lead(valid_from_date_hour) OVER (PARTITION BY identity_id ORDER BY valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour,
+
+is_deleted
+
+--atlas_sub: identify new records or the records with chnages from prior update
+-- get legacy account & individual id
+from 
+(
+    select
+    atlas_sub.subscription_id, 
+    atlas_sub.identity_id, 
+    atlas_sub.source_external_reference, /*** V2 ***/
+    legacy_sub.individual_id,
+    legacy_sub.account_id,
+    legacy_ind.household_id,
+    
+    atlas_sub.valid_from_date_hour, 
+    atlas_sub.isDeleted as is_deleted,
+
+    case when lag(struct(atlas_sub.identity_id, legacy_sub.account_id, legacy_sub.individual_id)) 
+        over(partition by atlas_sub.identity_id ORDER BY valid_from_date_hour)
+        = struct(atlas_sub.identity_id, legacy_sub.account_id, legacy_sub.individual_id) 
+    then false 
+    else true 
+    end as is_new_change
+
+    from sandbox_prod.data_eng.vehicle_device_dim_full legacy_sub
+    
+    join curated_prod.legacy.dim_subscription dim_sub
+    on dim_sub.sms_sbscrptn_id = legacy_sub.subscription_id
+    and dim_sub.is_latest_rec_ind = 'Y'
+
+    --get atlas subscriptions
+    join (   --cleansed events deduping multiple updates with same timestamp
+        --since only legacy subcriptions are checked for exists, no need to track subscription updates.
+        select subscriptionId as subscription_id, owner.identityId as identity_id, state,  
+        case when source.sms is not null then source.sms.externalReference
+            when source.zuora is not null then source.zuora.externalReference
+            when source.internal is not null then source.internal.externalReference
+            else 'unknown'
+        end as billing_platform_external_reference,
+        replace(replace(replace(replace(replace(billing_platform_external_reference, 'US_'), 'MX_'), 'PR_'), 'NL_'), '0.0.0.1 /service/subscription_') as source_external_reference,
+        valid_from_date_hour, isDeleted, envelopeTime 
+        from
+        ( 
+        select subscriptionId, owner, state, source, envelopeTime,
+        date_trunc('HOUR',from_utc_timestamp(envelopeTime,'GMT-5')) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.commerce.subscription_created_events
+        where isTest = false
+        and (source.sms is not null or source.zuora is not null or source.charon is not null or source.internal is not null)
+        union all
+        select subscriptionId, owner, state, source, envelopeTime,
+        date_trunc('HOUR',from_utc_timestamp(envelopeTime,'GMT-5')) as valid_from_date_hour, 
+        true as isDeleted from cleansed_prod.commerce.subscription_deleted_events
+        where isTest = false
+        and (source.sms is not null or source.zuora is not null or source.charon is not null or source.internal is not null)
+        )
+
+  ) atlas_sub
+  on  dim_sub.short_sbscrptn_id = atlas_sub.source_external_reference
+  
+  left join sandbox_prod.data_eng.individual_dim_full legacy_ind
+  on legacy_sub.individual_id = legacy_ind.individual_id
+
+  where legacy_sub.account_id is not null
+  and legacy_sub.etl_metadata_struct.etl_update_est_timestamp >= from_utc_timestamp(v_from_timestamp,'GMT-5')
+  and legacy_sub.etl_metadata_struct.etl_update_est_timestamp <  from_utc_timestamp(v_to_timestamp,'GMT-5')
+  --this need to be adjusted to valid from & to timestamp
+
+  --make sure to get one subscription per identity + update timestamp
+  --if identity has multiple subscriptions updated at same time, use state
+  --make sure to take the latest record from legacy sub (within atlas sub validity)
+  qualify row_number() over(partition by atlas_sub.identity_id, atlas_sub.valid_from_date_hour
+                            order by envelopeTime desc, isDeleted desc, 
+                                     case when state in ('active') then 1
+                                          when state in ('paused', 'past_due', 'pending_cancellation') then 2
+                                          else 3
+                                      end, 
+                                      --legacy_sub.valid_to_est_timestamp desc, 
+                                      dim_sub.sbscrptn_key_id desc,
+                                      legacy_sub.etl_metadata_struct.etl_update_est_timestamp desc) = 1
+)
+where is_new_change = true or is_deleted = true
+;
+
+select count(*) from sandbox_prod.sbosco.legacy_subscription_scd_stg;
+
+-- 71160187
+
+-- COMMAND ----------
+
+-- DBTITLE 1,atlas subscription_scd_stg
+/*** V2 ***/
+/** delta from & to timestamp are using against atlas subs instead of legacy subs - to accomodate late arriving atlas subscriptions **/
+drop table if exists  sandbox_prod.sbosco.atlas_subscription_stg;
+drop table if exists  sandbox_prod.sbosco.atlas_subscription_scd_stg;
+create table  sandbox_prod.sbosco.atlas_subscription_scd_stg
+select
+subscription_id, 
+identity_id, 
+source_external_reference, /*** V2 ***/
+individual_id,
+account_id,
+household_id,
+
+valid_from_date_hour,
+/*** V2 ***/
+coalesce(lead(valid_from_date_hour) OVER (PARTITION BY identity_id ORDER BY valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour,
+
+is_deleted
+
+--atlas_sub: identify new records or the records with chnages from prior update
+-- get legacy account & individual id
+from 
+(
+    select
+    atlas_sub.subscription_id, 
+    atlas_sub.identity_id, 
+    atlas_sub.source_external_reference, /*** V2 ***/
+    legacy_sub.individual_id,
+    legacy_sub.account_id,
+    legacy_ind.household_id,
+    
+    atlas_sub.valid_from_date_hour, 
+    atlas_sub.isDeleted as is_deleted,
+
+    case when lag(struct(atlas_sub.identity_id, legacy_sub.account_id, legacy_sub.individual_id)) 
+        over(partition by atlas_sub.identity_id ORDER BY valid_from_date_hour)
+        = struct(atlas_sub.identity_id, legacy_sub.account_id, legacy_sub.individual_id) 
+    then false 
+    else true 
+    end as is_new_change
+
+
+    from 
+    (   --cleansed events deduping multiple updates with same timestamp
+        --since only legacy subcriptions are checked for exists, no need to track subscription updates.
+        select subscriptionId as subscription_id, owner.identityId as identity_id, state,  
+        case when source.sms is not null then source.sms.externalReference
+            when source.zuora is not null then source.zuora.externalReference
+            when source.internal is not null then source.internal.externalReference
+            else 'unknown'
+        end as billing_platform_external_reference,
+        replace(replace(replace(replace(replace(billing_platform_external_reference, 'US_'), 'MX_'), 'PR_'), 'NL_'), '0.0.0.1 /service/subscription_') as source_external_reference,
+        valid_from_date_hour, isDeleted, envelopeTime 
+        from
+        ( 
+        select subscriptionId, owner, state, source, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        false as isDeleted from cleansed_prod.commerce.subscription_created_events
+        where isTest = false
+        and (source.sms is not null or source.zuora is not null or source.charon is not null or source.internal is not null)
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        union all
+        select subscriptionId, owner, state, source, envelopeTime,
+        from_utc_timestamp(envelopeTime,'GMT-5') as valid_from_est_timestamp,
+        date_trunc('HOUR',valid_from_est_timestamp) as valid_from_date_hour, 
+        true as isDeleted from cleansed_prod.commerce.subscription_deleted_events
+        where isTest = false
+        and (source.sms is not null or source.zuora is not null or source.charon is not null or source.internal is not null)
+        and envelopeTime >= v_from_timestamp and envelopeTime < v_to_timestamp /*** V2 ***/
+        )
+    
+) atlas_sub
+
+join curated_prod.legacy.dim_subscription dim_sub
+on dim_sub.short_sbscrptn_id = atlas_sub.source_external_reference
+and dim_sub.is_latest_rec_ind = 'Y'
+
+--assume this will be a history table in future     
+join sandbox_prod.data_eng.vehicle_device_dim_full legacy_sub
+on dim_sub.sms_sbscrptn_id = legacy_sub.subscription_id
+and legacy_sub.account_id is not null
+--this need to be adjusted once we have the history
+
+left join sandbox_prod.data_eng.individual_dim_full legacy_ind
+on legacy_sub.individual_id = legacy_ind.individual_id
+
+--make sure to take the latest record from legacy sub (within atlas sub validity)
+qualify row_number() over(partition by atlas_sub.identity_id, atlas_sub.valid_from_date_hour
+                          order by envelopeTime desc, isDeleted desc,
+                                   case when state in ('active') then 1
+                                        when state in ('paused', 'past_due', 'pending_cancellation') then 2
+                                    else 3
+                                    end,
+                                    --legacy_sub.valid_to_est_timestamp desc, 
+                                    dim_sub.sbscrptn_key_id desc,
+                                    legacy_sub.etl_metadata_struct.etl_update_est_timestamp desc) = 1
+)
+
+where is_new_change = true or is_deleted = true
+;
+
+select count(*) from sandbox_prod.sbosco.atlas_subscription_scd_stg;
+
+-- 94065681
+
+-- COMMAND ----------
+
+-- DBTITLE 1,unified_identity_stg
+drop table if exists sandbox_prod.sbosco.unified_identity_stg;
+create table sandbox_prod.sbosco.unified_identity_stg
+
+select
+idt_valid_from.identity_id,
+idt_valid_from.valid_from_date_hour,
+
+--valid to date hour
+/*** V2 ***/
+coalesce(lead(idt_valid_from.valid_from_date_hour) OVER (PARTITION BY idt_valid_from.identity_id ORDER BY idt_valid_from.valid_from_date_hour), cast('9999-12-31' as timestamp)) as valid_to_date_hour_stg,
+
+case when idt.is_deleted = false and valid_to_date_hour_stg = '9999-12-31 00:00:00.000' then true else false end as is_current,
+
+/*** V2 ***/
+--identity:
+case when idt.is_deleted = false then idt.email_address end as email_address,
+case when idt.is_deleted = false then idt.phone_number end as phone_number,
+idt.is_deleted as idt_is_deleted,
+idt.idt_create_est_timestamp,
+idt.idt_update_est_timestamp,
+idt.valid_from_date_hour as idt_valid_from_date_hour,
+
+/*** V2 ***/
+--billing profile:
+bp.billing_profile_id,
+case when bp.is_deleted = false then bp.first_name end as bp_first_name,
+case when bp.is_deleted = false then bp.last_name end as bp_last_name,
+case when bp.is_deleted = false then bp.service_address_struct end as bp_address_struct,
+bp.is_deleted as is_bp_deleted,
+bp.valid_from_date_hour as bp_valid_from_date_hour,
+
+/*** V2 ***/
+--household link: 
+--UI SCD has household link as UI if individual id source = 'atlas-stripe'
+case when hh.is_deleted = false then hh.individual_id end as hh_individual_id,
+case when hh.is_deleted = false then hh.household_id end as household_id,
+hh.is_deleted as is_hh_deleted,
+hh.valid_from_date_hour as hh_valid_from_date_hour,
+
+/*** V2 ***/
+--atlas & legacy subscription:
+coalesce(atsub.subscription_id, legacy_sub.subscription_id) as atsub_subscription_id,
+coalesce(atsub.source_external_reference, legacy_sub.source_external_reference) as legacy_subscription_id,
+
+coalesce(case when atsub.is_deleted = false then atsub.individual_id end, 
+         case when legacy_sub.is_deleted = false then legacy_sub.individual_id end) as legacy_individual_id,
+coalesce(case when atsub.is_deleted = false then atsub.account_id end, 
+         case when legacy_sub.is_deleted = false then legacy_sub.account_id end) as legacy_account_id,
+coalesce(atsub.is_deleted, legacy_sub.is_deleted) as is_atsub_deleted,
+coalesce(atsub.valid_from_date_hour, legacy_sub.valid_from_date_hour) as subscription_valid_from_date_hour,
+
+/*** V2 ***/
+--identity_individual_id_source
+case when bp_first_name is not null and hh_individual_id is not null and is_bp_deleted <> true  then 'atlas-stripe'
+     when legacy_individual_id is not null and is_atsub_deleted <> true then 'legacy'
+     when legacy_account_id is not null then 'legacy-account'
+     else 'atlas-identity'
+end as identity_individual_id_source
+
+from
+(
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.identity_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.billing_profile_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.household_link_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.atlas_subscription_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.legacy_subscription_scd_stg
+) idt_valid_from
+
+left join sandbox_prod.sbosco.identity_scd_stg idt
+on idt.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= idt.valid_from_date_hour
+and (idt_valid_from.valid_from_date_hour < idt.valid_to_date_hour or idt.is_deleted = true) /*** V2 ***/
+
+left join sandbox_prod.sbosco.billing_profile_scd_stg bp
+on bp.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= bp.valid_from_date_hour
+and (idt_valid_from.valid_from_date_hour < bp.valid_to_date_hour or bp.is_deleted = true) /*** V2 ***/
+
+left join sandbox_prod.sbosco.household_link_scd_stg hh
+on hh.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= hh.valid_from_date_hour
+and (idt_valid_from.valid_from_date_hour < hh.valid_to_date_hour or hh.is_deleted = true) /*** V2 ***/
+
+left join sandbox_prod.sbosco.atlas_subscription_scd_stg atsub
+on atsub.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= atsub.valid_from_date_hour
+and (idt_valid_from.valid_from_date_hour < atsub.valid_to_date_hour or atsub.is_deleted = true) /*** V2 ***/
+
+/*** V2 ***/
+left join sandbox_prod.sbosco.legacy_subscription_scd_stg legacy_sub
+on legacy_sub.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= legacy_sub.valid_from_date_hour
+and (idt_valid_from.valid_from_date_hour < legacy_sub.valid_to_date_hour or legacy_sub.is_deleted = true) /*** V2 ***/
+
+;
+
+select count(*) from sandbox_prod.sbosco.unified_identity_stg; --216136228
+
+
+
+-- COMMAND ----------
+
+select identity_individual_id_source, count(*) from sandbox_prod.sbosco.unified_identity_stg
+group by 1
+
+-- COMMAND ----------
+
+-- DBTITLE 1,copy-for delta
+drop table if exists sandbox_prod.sbosco.unified_identity_stg;
+create table sandbox_prod.sbosco.unified_identity_stg
+
+select
+idt_valid_from.identity_id,
+idt_valid_from.valid_from_date_hour,
+
+--valid to date hour
+case when idt.is_deleted  = true then idt_valid_from.valid_from_date_hour
+      else coalesce(lead(idt_valid_from.valid_from_date_hour) OVER (PARTITION BY idt_valid_from.identity_id ORDER BY idt_valid_from.valid_from_date_hour), cast('9999-12-31' as timestamp))         
+end as valid_to_date_hour_stg,
+
+case when idt.is_deleted = false and valid_to_date_hour_stg = '9999-12-31 00:00:00.000' then true else false end as is_current,
+
+/*** V2 ***/
+--identity: if not available in delta, take it from ui_scd valid on valid_from_date_hour
+coalesce(idt.email_address, ui_scd.email_address) as email_address,
+coalesce(idt.phone_number, ui_scd.phone_number) as phone_number,
+coalesce(idt.created_est_timestamp, ui_scd.created_est_timestamp) as created_est_timestamp,
+coalesce(idt.is_deleted, ui_scd.is_deleted) as idt_is_deleted,
+coalesce(idt.valid_from_date_hour, ui_scd.additional_info_struct.identity_update_est_timestamp) as identity_update_est_timestamp,
+
+/*** V2 ***/
+--billing profile: if not available in delta, take it from ui_scd valid on valid_from_date_hour
+bp.billing_profile_id,
+coalesce(bp.first_name, ui_scd.first_name) as bp_first_name,
+coalesce(bp.last_name, ui_scd.last_name) as bp_last_name,
+coalesce(bp.service_address_struct, ui_scd.address_struct) as bp_address_struct,
+coalesce(bp.is_deleted, ui_scd.additional_info_struct.is_billing_profile_deleted) as is_bp_deleted,
+coalesce(bp.valid_from_date_hour, ui_scd.additional_info_struct.billing_profile_update_est_timestamp) as billing_profile_update_est_timestamp,
+
+/*** V2 ***/
+--household link: if not available in delta, take it from ui_scd valid on valid_from_date_hour
+--UI SCD has household link as UI if individual id source = 'atlas-stripe'
+coalesce(hh.individual_id, case when ui_scd.individual_id_source = 'atlas-stripe' then ui_scd.individual_id end) as hh_individual_id,
+hh.household_id,
+coalesce(hh.is_deleted, ui_scd.additional_info_struct.is_household_link_deleted) as is_hh_deleted,
+coalesce(hh.valid_from_date_hour, ui_scd.additional_info_struct.household_link_update_est_timestamp) as household_link_update_est_timestamp,
+
+/*** V2 ***/
+/*case when atsub.subscription_id is not null then true else false end as is_linked_to_legacy_subscription,
+case when is_linked_to_legacy_subscription and atsub.account_id is not null then true else false end as is_legacy_sub_found,
+*/
+/*** V2 ***/
+coalesce(atsub.subscription_id, legacy_sub.subscription_id) as atsub_subscription_id,
+coalesce(atsub.billing_platform_external_reference, legacy_sub.billing_platform_external_reference) as legacy_subscription_id,
+
+coalesce(atsub.individual_id, legacy_sub.individual_id, case when ui_scd.individual_id_source = 'legacy' then ui_scd.individual_id end) as legacy_individual_id,
+coalesce(atsub.account_id, legacy_sub.account_id, ui_scd.additional_info_struct.linked_legacy_account_id) as legacy_account_id,
+coalesce(atsub.is_deleted, legacy_sub.is_deleted, ui_scd.additional_info_struct.is_subscription_deleted) as is_atsub_deleted,
+coalesce(atsub.valid_from_date_hour, ui_scd.additional_info_struct.subscription_update_est_timestamp) as subscription_update_est_timestamp,
+
+
+
+/*** V2 ***/
+--identity_individual_id_source
+--if dimension is not available use UI SCD
+case when bp_first_name is not null and hh_individual_id is not null and is_bp_deleted <> true  then 'atlas-stripe'
+     when legacy_individual_id is not null and is_atsub_deleted <> true then 'legacy'
+     when legacy_account_id is not null then 'legacy-account'
+     else 'atlas-identity'
+end as identity_individual_id_source
+
+from
+(
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.identity_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.billing_profile_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.household_link_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.atlas_subscription_scd_stg
+union
+select identity_id, valid_from_date_hour from sandbox_prod.sbosco.legacy_subscription_scd_stg
+) idt_valid_from
+
+left join sandbox_prod.sbosco.identity_scd_stg idt
+on idt.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= idt.valid_from_date_hour
+and idt_valid_from.valid_from_date_hour < idt.valid_to_date_hour
+
+left join sandbox_prod.sbosco.billing_profile_scd_stg bp
+on bp.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= bp.valid_from_date_hour
+and idt_valid_from.valid_from_date_hour < bp.valid_to_date_hour
+
+left join sandbox_prod.sbosco.household_link_scd_stg hh
+on hh.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= hh.valid_from_date_hour
+and idt_valid_from.valid_from_date_hour < hh.valid_to_date_hour
+
+left join sandbox_prod.sbosco.atlas_subscription_scd_stg atsub
+on atsub.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= atsub.valid_from_date_hour
+and idt_valid_from.valid_from_date_hour < atsub.valid_to_date_hour
+
+/*** V2 ***/
+left join sandbox_prod.sbosco.legacy_subscription_scd_stg legacy_sub
+on legacy_sub.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= legacy_sub.valid_from_date_hour
+and idt_valid_from.valid_from_date_hour < legacy_sub.valid_to_date_hour
+
+/*** V2 ***/
+/** to cover the missing dimensions in delta **/
+left join sandbox_prod.sbosco.unified_identity_scd ui_scd
+on ui_scd.identity_id = idt_valid_from.identity_id
+and idt_valid_from.valid_from_date_hour >= ui_scd.valid_from_est_timestamp
+and idt_valid_from.valid_from_date_hour < ui_scd.valid_to_est_timestamp
+;
+
+select count(*) from sandbox_prod.sbosco.unified_identity_stg; --216136228
+
+
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Merge - Atlas individual ids into Person
+/*** V2 ***/
+/** column names changed and idt_update_est_timestamp used in order by **/
+merge into sandbox_prod.sbosco.person_dim pd
+using (select uuid() as person_id, --for delta, can we create uuid only for missing ind ds? not covered in this notebook
+      hh_individual_id, 'atlas' as individual_id_source, household_id, identity_id,
+      email_address,
+      bp_address_struct, 
+      bp_first_name,
+      bp_last_name,
+      phone_number
+      from sandbox_prod.sbosco.unified_identity_stg
+      where identity_individual_id_source = 'atlas-stripe'
+      qualify row_number() over(partition by hh_individual_id order by idt_update_est_timestamp desc) = 1 
+      --take most recently updated identity as primary identity if one individual id linked to multiple identities
+      ) ui_stg
+on pd.individual_id = ui_stg.hh_individual_id
+
+when matched --update if different since atlas takes precedence
+and ( pd.source <> ui_stg.individual_id_source or
+      pd.household_id <> ui_stg.household_id or
+      pd.best_email_address <> ui_stg.email_address or
+      pd.best_address_struct <> ui_stg.bp_address_struct or
+      pd.best_first_name <> ui_stg.bp_first_name or
+      pd.best_last_name <> ui_stg.bp_last_name or
+      pd.best_phone_number <> ui_stg.phone_number or
+      pd.primary_identity_id <> ui_stg.identity_id
+) then
+update set 
+source = ui_stg.individual_id_source,
+household_id = ui_stg.household_id, 
+best_email_address = ui_stg.email_address ,
+best_address_struct = ui_stg.bp_address_struct, 
+best_first_name = ui_stg.bp_first_name, 
+best_last_name = ui_stg.bp_last_name, 
+best_phone_number = ui_stg.phone_number,
+primary_identity_id = ui_stg.identity_id,
+primary_legacy_account_id = null
+
+when not matched then insert
+( person_id, source, individual_id, household_id, best_email_address, best_address_struct, best_first_name, best_last_name, best_phone_number, state, primary_identity_id)
+values (
+ui_stg.person_id,
+ui_stg.individual_id_source,
+ui_stg.hh_individual_id,
+ui_stg.household_id,
+ui_stg.email_address,
+ui_stg.bp_address_struct,
+ui_stg.bp_first_name,
+ui_stg.bp_last_name,
+ui_stg.phone_number,
+'active',
+ui_stg.identity_id
+); --2240242
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Merge - Legacy individual ids into person
+merge into sandbox_prod.sbosco.person_dim pd
+using (
+      select
+      uuid() as person_id,
+      vdd.individual_id,
+      vdd.account_id,
+      ind.household_id,
+      ind.best_email_address, 
+      struct(ind.best_address_city as city, 
+            ind.best_address_state as state, 
+            ind.best_address_zip_code as zip_code, 
+            ind.best_address_line1 as address_line_1, 
+            ind.best_address_line2 as address_line_2, 
+            substring(ind.best_address_country_code,1,2) as country) as best_address_struct,
+      ind.first_name as best_first_name, 
+      ind.last_name as best_last_name, 
+      ind.best_phone_number
+
+      from (select individual_id, account_id 
+            from sandbox_prod.data_eng.vehicle_device_dim_full -- should be only vehicle devices
+            where account_id is not null 
+            and individual_id is not null
+            qualify row_number() over(partition by individual_id order by etl_metadata_struct.etl_update_est_timestamp desc) = 1
+            /*** V2 ***/ --take most recently updated account as primary account
+            ) vdd
+
+      join sandbox_prod.data_eng.individual_dim_full ind  
+      on ind.individual_id = vdd.individual_id 
+) leg
+on pd.individual_id = leg.individual_id
+
+when not matched then insert
+( person_id, source, individual_id, household_id, best_email_address, best_address_struct, best_first_name, best_last_name, best_phone_number, state, primary_legacy_account_id)
+values (
+leg.person_id,
+'legacy', 
+leg.individual_id,
+leg.household_id,
+leg.best_email_address,
+leg.best_address_struct,
+leg.best_first_name,
+leg.best_last_name,
+leg.best_phone_number,
+'active',
+leg.account_id
+); --210912001
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Merge - Legacy accounts with no individual ids
+/** For delta: change to merge process as above **/
+insert into sandbox_prod.sbosco.person_dim 
+(person_id, source, state, primary_legacy_account_id)
+
+select 
+uuid() as person_id,
+'legacy-account' as person_id_source,
+'active' as state,
+account_id
+from (select distinct account_id 
+      from sandbox_prod.data_eng.vehicle_device_dim_full
+      where account_id is not null 
+      and individual_id is null
+      --and delivery method = ?? should be only vehicle devices, should be adjusted after adding delivery method
+)
+;
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Merge-Other Atlas identities
+/***** 
+Atlas identities not having Billing Profile + Individual Id AND not linked to legacy subscriptions.
+Person id will be generated for each identity id
+--for initial loading only 
+--since we will not use the atlas individual id, we will add identity id to person dim to link to the identity later
+*****/
+/** For delta: change to merge process as above **/
+
+insert into sandbox_prod.sbosco.person_dim 
+(person_id, source, best_email_address, best_phone_number, state, primary_identity_id)
+select 
+
+uuid() as person_id,
+'atlas-identity' as source,
+
+email_address,
+phone_number,
+'active' as state,
+identity_id
+
+from sandbox_prod.sbosco.unified_identity_stg
+where identity_individual_id_source = 'atlas-identity'
+qualify row_number() over (partition by identity_id order by valid_from_date_hour desc) = 1
+
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED IDENTITY SCD - atlas-stripe
+insert into sandbox_prod.sbosco.unified_identity_scd
+( unified_identity_id, source, identity_id, person_id, individual_id, individual_id_source,  email_address, address_struct, first_name, last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, created_est_timestamp, valid_from_est_timestamp, valid_to_est_timestamp, is_current, is_deleted, additional_info_struct, prior_person_struct)
+
+select identity_id, 'atlas', identity_id, person_id, hh_individual_id, identity_individual_id_source, email_address, bp_address_struct, bp_first_name, bp_last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, idt_create_est_timestamp, valid_from_date_hour, valid_to_date_hour_stg, is_current, idt_is_deleted, additional_info_struct,
+struct(
+     prior_person_id,
+     case when prior_person_id is not null then valid_from_date_hour end as change_est_timestamp
+)
+
+from (
+     select
+     stg.identity_id,
+     pd.person_id,
+     stg.hh_individual_id,
+     stg.identity_individual_id_source,
+     stg.email_address,
+     stg.bp_address_struct,
+     stg.bp_first_name,
+     stg.bp_last_name,
+     stg.phone_number,
+
+     case when stg.bp_first_name is null and pd.best_first_name is null then null
+          when stg.bp_first_name = pd.best_first_name then true 
+          else false 
+     end as is_best_first_name,
+     case when stg.bp_last_name is null and pd.best_last_name is null then null
+          when stg.bp_last_name = pd.best_last_name then true 
+          else false 
+     end as is_best_last_name, 
+     case when stg.email_address is null and pd.best_email_address is null then null
+          when stg.email_address = pd.best_email_address then true 
+          else false 
+     end as is_best_email_address, 
+     case when stg.phone_number is null and pd.best_phone_number is null then null
+          when stg.phone_number = pd.best_phone_number then true 
+          else false 
+     end as is_best_phone_number, 
+     case when stg.bp_address_struct is null and pd.best_address_struct is null then null
+     when stg.bp_address_struct = pd.best_address_struct then true 
+     else false 
+     end as is_best_address,
+     case when stg.identity_id is null and pd.primary_identity_id is null then null
+     when stg.identity_id = pd.primary_identity_id then true 
+     else false 
+     end as is_primary,
+
+     stg.idt_create_est_timestamp,
+
+     stg.valid_from_date_hour,
+     stg.valid_to_date_hour_stg,
+     stg.is_current,
+     stg.idt_is_deleted,
+
+     --additional info struct
+     struct(
+     stg.billing_profile_id,
+     stg.atsub_subscription_id as subscription_id,
+     stg.legacy_subscription_id,
+     stg.idt_valid_from_date_hour as identity_valid_from_est_timestamp,
+     stg.bp_valid_from_date_hour as billing_profile_valid_from_est_timestamp,
+     stg.hh_valid_from_date_hour as household_link_valid_from_est_timestamp,
+     stg.subscription_valid_from_date_hour as subscription_valid_from_est_timestamp,
+     stg.is_bp_deleted as is_billing_profile_deleted,
+     stg.is_hh_deleted as is_household_link_deleted,
+     stg.is_atsub_deleted as is_subscription_deleted,
+     stg.legacy_account_id as linked_legacy_account_id) as additional_info_struct,
+
+     --prior person
+     lag(pd.person_id) over(partition by stg.identity_id order by stg.valid_from_date_hour) as prior_person_id
+
+     from sandbox_prod.sbosco.unified_identity_stg stg
+     left join sandbox_prod.sbosco.person_dim pd  
+     on pd.individual_id = stg.hh_individual_id
+     where stg.identity_individual_id_source = 'atlas-stripe'
+)
+/*
+     or
+     (identity_individual_id_source = 'legacy' and pd.individual_id = stg.legacy_individual_id)
+     or
+     (identity_individual_id_source = 'atlas-identity' and pd.missing_individual_id_struct.identity_id = stg.identity_id) 
+     or
+     (identity_individual_id_source = 'legacy-account' and pd.missing_individual_id_struct.legacy_account_id = stg.legacy_account_id)
+     ) 
+*/
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED IDENTITY SCD - legacy
+insert into sandbox_prod.sbosco.unified_identity_scd
+( unified_identity_id, source, identity_id, person_id, individual_id, individual_id_source,  email_address, address_struct, first_name, last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, created_est_timestamp, valid_from_est_timestamp, valid_to_est_timestamp, is_current, is_deleted, additional_info_struct, prior_person_struct)
+
+select identity_id, 'atlas', identity_id, person_id, legacy_individual_id, identity_individual_id_source, email_address, bp_address_struct, bp_first_name, bp_last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, idt_create_est_timestamp, valid_from_date_hour, valid_to_date_hour_stg, is_current, idt_is_deleted, additional_info_struct,
+struct(
+     prior_person_id,
+     case when prior_person_id is not null then valid_from_date_hour end as change_est_timestamp
+)
+from (
+
+     select
+     stg.identity_id,
+     pd.person_id,
+     stg.legacy_individual_id,
+     stg.identity_individual_id_source,
+     stg.email_address,
+     stg.bp_address_struct,
+     stg.bp_first_name,
+     stg.bp_last_name,
+     stg.phone_number,
+
+     case when stg.bp_first_name is null and pd.best_first_name is null then null
+          when stg.bp_first_name = pd.best_first_name then true 
+          else false 
+     end as is_best_first_name,
+     case when stg.bp_last_name is null and pd.best_last_name is null then null
+          when stg.bp_last_name = pd.best_last_name then true 
+          else false 
+     end as is_best_last_name, 
+     case when stg.email_address is null and pd.best_email_address is null then null
+          when stg.email_address = pd.best_email_address then true 
+          else false 
+     end as is_best_email_address, 
+     case when stg.phone_number is null and pd.best_phone_number is null then null
+          when stg.phone_number = pd.best_phone_number then true 
+          else false 
+     end as is_best_phone_number, 
+     case when stg.bp_address_struct is null and pd.best_address_struct is null then null
+     when stg.bp_address_struct = pd.best_address_struct then true 
+     else false 
+     end as is_best_address,
+     case when stg.identity_id is null and pd.primary_identity_id is null then null
+     when stg.identity_id = pd.primary_identity_id then true 
+     else false 
+     end as is_primary,
+
+     stg.idt_create_est_timestamp,
+
+     stg.valid_from_date_hour,
+     stg.valid_to_date_hour_stg,
+     stg.is_current,
+     stg.idt_is_deleted,
+
+     --additional info struct
+     struct(
+     stg.billing_profile_id,
+     stg.atsub_subscription_id as subscription_id,
+     stg.legacy_subscription_id,
+     stg.idt_valid_from_date_hour as identity_valid_from_est_timestamp,
+     stg.bp_valid_from_date_hour as billing_profile_valid_from_est_timestamp,
+     stg.hh_valid_from_date_hour as household_link_valid_from_est_timestamp,
+     stg.subscription_valid_from_date_hour as subscription_valid_from_est_timestamp,
+     stg.is_bp_deleted as is_billing_profile_deleted,
+     stg.is_hh_deleted as is_household_link_deleted,
+     stg.is_atsub_deleted as is_subscription_deleted,
+     stg.legacy_account_id as linked_legacy_account_id) as additional_info_struct,
+
+     --prior person
+     lag(pd.person_id) over(partition by stg.identity_id order by stg.valid_from_date_hour) as prior_person_id
+
+
+     from sandbox_prod.sbosco.unified_identity_stg stg
+
+     left join sandbox_prod.sbosco.person_dim pd  
+     on pd.individual_id = stg.legacy_individual_id
+
+     where stg.identity_individual_id_source = 'legacy'
+)
+
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED IDENTITY SCD - atlas-identity
+insert into sandbox_prod.sbosco.unified_identity_scd
+( unified_identity_id, source, identity_id, person_id, email_address, address_struct, first_name, last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, created_est_timestamp, valid_from_est_timestamp, valid_to_est_timestamp, is_current, is_deleted, additional_info_struct, prior_person_struct)
+
+select identity_id, 'atlas', identity_id, person_id, email_address, bp_address_struct, bp_first_name, bp_last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, idt_create_est_timestamp, valid_from_date_hour, valid_to_date_hour_stg, is_current, idt_is_deleted, additional_info_struct,
+struct(
+     prior_person_id,
+     case when prior_person_id is not null then valid_from_date_hour end as change_est_timestamp
+)
+from (
+
+select
+stg.identity_id,
+pd.person_id,
+stg.email_address,
+stg.bp_address_struct,
+stg.bp_first_name,
+stg.bp_last_name,
+stg.phone_number,
+
+case when stg.bp_first_name is null and pd.best_first_name is null then null
+     when stg.bp_first_name = pd.best_first_name then true 
+     else false 
+end as is_best_first_name,
+case when stg.bp_last_name is null and pd.best_last_name is null then null
+     when stg.bp_last_name = pd.best_last_name then true 
+     else false 
+end as is_best_last_name, 
+case when stg.email_address is null and pd.best_email_address is null then null
+     when stg.email_address = pd.best_email_address then true 
+     else false 
+end as is_best_email_address, 
+case when stg.phone_number is null and pd.best_phone_number is null then null
+     when stg.phone_number = pd.best_phone_number then true 
+     else false 
+end as is_best_phone_number, 
+case when stg.bp_address_struct is null and pd.best_address_struct is null then null
+    when stg.bp_address_struct = pd.best_address_struct then true 
+    else false 
+end as is_best_address,
+case when stg.identity_id is null and pd.primary_identity_id is null then null
+    when stg.identity_id = pd.primary_identity_id then true 
+    else false 
+end as is_primary,
+
+stg.idt_create_est_timestamp,
+
+     stg.valid_from_date_hour,
+     stg.valid_to_date_hour_stg,
+     stg.is_current,
+     stg.idt_is_deleted,
+
+     --additional info struct
+     struct(
+     stg.billing_profile_id,
+     stg.atsub_subscription_id as subscription_id,
+     stg.legacy_subscription_id,
+     stg.idt_valid_from_date_hour as identity_valid_from_est_timestamp,
+     stg.bp_valid_from_date_hour as billing_profile_valid_from_est_timestamp,
+     stg.hh_valid_from_date_hour as household_link_valid_from_est_timestamp,
+     stg.subscription_valid_from_date_hour as subscription_valid_from_est_timestamp,
+     stg.is_bp_deleted as is_billing_profile_deleted,
+     stg.is_hh_deleted as is_household_link_deleted,
+     stg.is_atsub_deleted as is_subscription_deleted,
+     stg.legacy_account_id as linked_legacy_account_id) as additional_info_struct,
+
+     --prior person
+     lag(pd.person_id) over(partition by stg.identity_id order by stg.valid_from_date_hour) as prior_person_id
+
+
+from sandbox_prod.sbosco.unified_identity_stg stg
+
+left join sandbox_prod.sbosco.person_dim pd  
+on pd.primary_identity_id = stg.identity_id
+and pd.source = 'atlas-identity'
+
+where stg.identity_individual_id_source = 'atlas-identity'
+)
+/*
+     or
+     (identity_individual_id_source = 'legacy' and pd.individual_id = stg.legacy_individual_id)
+     or
+     (identity_individual_id_source = 'atlas-identity' and pd.missing_individual_id_struct.identity_id = stg.identity_id) 
+     or
+     (identity_individual_id_source = 'legacy-account' and pd.missing_individual_id_struct.legacy_account_id = stg.legacy_account_id)
+     ) 
+*/
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED IDENTITY SCD - legacy-account
+
+insert into sandbox_prod.sbosco.unified_identity_scd
+( unified_identity_id, source, identity_id, person_id, email_address, address_struct, first_name, last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, created_est_timestamp, valid_from_est_timestamp, valid_to_est_timestamp, is_current, is_deleted, additional_info_struct, prior_person_struct)
+
+select identity_id, 'atlas', identity_id, person_id, email_address, bp_address_struct, bp_first_name, bp_last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, idt_create_est_timestamp, valid_from_date_hour, valid_to_date_hour_stg, is_current, idt_is_deleted, additional_info_struct,
+struct(
+     prior_person_id,
+     case when prior_person_id is not null then valid_from_date_hour end as change_est_timestamp
+)
+from (
+
+     select
+     stg.identity_id,
+     pd.person_id,
+     stg.email_address,
+     stg.bp_address_struct,
+     stg.bp_first_name,
+     stg.bp_last_name,
+     stg.phone_number,
+
+     case when stg.bp_first_name is null and pd.best_first_name is null then null
+          when stg.bp_first_name = pd.best_first_name then true 
+          else false 
+     end as is_best_first_name,
+     case when stg.bp_last_name is null and pd.best_last_name is null then null
+          when stg.bp_last_name = pd.best_last_name then true 
+          else false 
+     end as is_best_last_name, 
+     case when stg.email_address is null and pd.best_email_address is null then null
+          when stg.email_address = pd.best_email_address then true 
+          else false 
+     end as is_best_email_address, 
+     case when stg.phone_number is null and pd.best_phone_number is null then null
+          when stg.phone_number = pd.best_phone_number then true 
+          else false 
+     end as is_best_phone_number, 
+     case when stg.bp_address_struct is null and pd.best_address_struct is null then null
+     when stg.bp_address_struct = pd.best_address_struct then true 
+     else false 
+     end as is_best_address,
+     case when stg.identity_id is null and pd.primary_identity_id is null then null
+     when stg.identity_id = pd.primary_identity_id then true 
+     else false 
+     end as is_primary,
+
+     stg.idt_create_est_timestamp,
+
+     stg.valid_from_date_hour,
+     stg.valid_to_date_hour_stg,
+     stg.is_current,
+     stg.idt_is_deleted,
+
+     --additional info struct
+     struct(
+     stg.billing_profile_id,
+     stg.atsub_subscription_id as subscription_id,
+     stg.legacy_subscription_id,
+     stg.idt_valid_from_date_hour as identity_valid_from_est_timestamp,
+     stg.bp_valid_from_date_hour as billing_profile_valid_from_est_timestamp,
+     stg.hh_valid_from_date_hour as household_link_valid_from_est_timestamp,
+     stg.subscription_valid_from_date_hour as subscription_valid_from_est_timestamp,
+     stg.is_bp_deleted as is_billing_profile_deleted,
+     stg.is_hh_deleted as is_household_link_deleted,
+     stg.is_atsub_deleted as is_subscription_deleted,
+     stg.legacy_account_id as linked_legacy_account_id) as additional_info_struct,
+
+     --prior person
+     lag(pd.person_id) over(partition by stg.identity_id order by stg.valid_from_date_hour) as prior_person_id
+
+from sandbox_prod.sbosco.unified_identity_stg stg
+
+left join sandbox_prod.sbosco.person_dim pd  
+on pd.primary_legacy_account_id = stg.legacy_account_id
+and pd.source = 'legacy-account'
+
+where stg.identity_individual_id_source = 'legacy-account'
+--this join was due to multiple atlas stripe individual ids for same identity
+)
+/*
+     or
+     (identity_individual_id_source = 'legacy' and pd.individual_id = stg.legacy_individual_id)
+     or
+     (identity_individual_id_source = 'atlas-identity' and pd.missing_individual_id_struct.identity_id = stg.identity_id) 
+     or
+     (identity_individual_id_source = 'legacy-account' and pd.missing_individual_id_struct.legacy_account_id = stg.legacy_account_id)
+     ) 
+*/
+
+-- COMMAND ----------
+
+select source, count(*) from sandbox_prod.sbosco.unified_identity_scd
+group by 1
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED_IDENTITY_SCD - legacy accounts with Individual Id
+/*** V2 ***/
+insert into sandbox_prod.sbosco.unified_identity_scd
+( unified_identity_id, source, legacy_account_id, person_id, individual_id, individual_id_source,  email_address, address_struct, first_name, last_name, phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, valid_from_est_timestamp, valid_to_est_timestamp, is_current)
+
+select 'A:' || account_id, 'legacy', account_id, person_id, individual_id, 'legacy', best_email_address, address_struct, first_name, last_name, best_phone_number, is_best_first_name, is_best_last_name, is_best_email_address, is_best_phone_number, is_best_address, is_primary, valid_from_est_timestamp, valid_to_est_timestamp, is_current
+
+
+from (
+
+     select
+     --account info from legacy
+     vdd.account_id, 
+
+     --person_id
+     pd.person_id,
+
+     --individual id from legacy
+     vdd.individual_id,
+
+
+     ind.best_email_address, 
+     struct(ind.best_address_city as city, 
+          ind.best_address_state as state, 
+          ind.best_address_zip_code as zip_code, 
+          ind.best_address_line1 as address_line_1, 
+          ind.best_address_line2 as address_line_2, 
+          substring(ind.best_address_country_code,1,2) as country) as address_struct,
+     ind.first_name as first_name, 
+     ind.last_name as last_name, 
+     ind.best_phone_number,
+
+     case when ind.first_name is null and pd.best_first_name is null then null
+          when ind.first_name = pd.best_first_name then true 
+          else false 
+     end as is_best_first_name,
+     case when ind.last_name is null and pd.best_last_name is null then null
+          when ind.last_name = pd.best_last_name then true 
+          else false 
+     end as is_best_last_name, 
+     case when ind.best_email_address is null and pd.best_email_address is null then null
+          when ind.best_email_address = pd.best_email_address then true 
+          else false 
+     end as is_best_email_address, 
+     case when ind.best_phone_number is null and pd.best_phone_number is null then null
+          when ind.best_phone_number = pd.best_phone_number then true 
+          else false 
+     end as is_best_phone_number, 
+     case when address_struct is null and pd.best_address_struct is null then null
+     when address_struct = pd.best_address_struct then true 
+     else false 
+     end as is_best_address,
+     case when vdd.account_id is null and pd.primary_legacy_account_id is null then null
+          when  vdd.account_id = pd.primary_legacy_account_id then true 
+          else false 
+     end as is_primary,
+
+     --history should be created from legacy account tables  for production
+     date_trunc('HOUR',ind.etl_metadata_struct.etl_update_est_timestamp) as valid_from_est_timestamp,
+     cast('9999-12-31' as timestamp) as valid_to_est_timestamp,
+     true as is_current
+
+     from (select account_id, individual_id 
+          from sandbox_prod.data_eng.vehicle_device_dim_full
+          where account_id is not null 
+          and individual_id is not null
+          qualify row_number() over(partition by account_id order by etl_metadata_struct.etl_update_est_timestamp desc) = 1) vdd
+
+     join sandbox_prod.data_eng.individual_dim_full ind  
+     on ind.individual_id = vdd.individual_id
+
+     left join sandbox_prod.sbosco.person_dim pd  
+     on pd.individual_id = vdd.individual_id
+
+)
+
+--
+
+
+-- COMMAND ----------
+
+-- DBTITLE 1,UNIFIED_IDENTITY_SCD: Legacy accounts with no individual ids
+/*** V2 ***/
+insert into sandbox_prod.sbosco.unified_identity_scd ( 
+unified_identity_id, source, legacy_account_id, person_id, is_primary, valid_from_est_timestamp, valid_to_est_timestamp, is_current)
+
+select
+
+'A:' || vdd.account_id as unified_identity_id,
+'legacy' as unified_identity_source, 
+
+--account info from legacy
+vdd.account_id as legacy_account_id, 
+
+--person_id
+pd.person_id,
+case when vdd.account_id is null and pd.primary_legacy_account_id is null then null
+      when  vdd.account_id = pd.primary_legacy_account_id then true 
+      else false 
+end as is_primary,
+
+--history should be created from legacy account tables  for production
+date_trunc('HOUR',vdd.etl_metadata_struct.etl_update_est_timestamp) as valid_from_est_timestamp,
+cast('9999-12-31' as timestamp) as valid_to_est_timestamp,
+true as is_current
+
+from (select account_id, etl_metadata_struct 
+      from sandbox_prod.data_eng.vehicle_device_dim_full
+      where account_id is not null 
+      and individual_id is null
+      qualify row_number() over(partition by account_id order by etl_metadata_struct.etl_update_est_timestamp desc) = 1) vdd
+
+
+left join sandbox_prod.sbosco.person_dim pd  
+on pd.primary_legacy_account_id = vdd.account_id
+--54425432
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC **validations**
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Identities: No duplicates with history
+select identity_id, valid_from_est_timestamp, count(*)
+from sandbox_prod.sbosco.unified_identity_scd
+group by 1,2
+having count(*) > 1
+order by 3 desc
+
+-- COMMAND ----------
+
+-- DBTITLE 1,Legacy accounts: No duplicates with history
+select legacy_account_id, count(*)
+from sandbox_prod.sbosco.unified_identity_scd
+where source = 'legacy'
+group by 1 having count(*) > 1
+order by 1
+
+-- COMMAND ----------
+
+-- DBTITLE 1,All legacy accounts are covered
+select vdd.*
+from sandbox_prod.data_eng.vehicle_device_dim_full vdd
+left join sandbox_prod.sbosco.unified_identity_scd uis
+on vdd.account_id = uis.legacy_account_id
+where uis.legacy_account_id is null
+and vdd.account_id is not null 
+and vdd.subscription_id is not null
+
+-- COMMAND ----------
+
+-- DBTITLE 1,person_dim - no individual id duplicates
+select individual_id, count(*) from sandbox_prod.sbosco.person_dim
+group by 1 having count(*) > 1 
+order by 2 desc
 
