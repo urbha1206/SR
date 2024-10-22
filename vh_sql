@@ -1,0 +1,172 @@
+%md
+##### vehicle_device_scd
+- Change history created when one/moe of the following entities have changed linked to the device
+  - device_dim
+  - vehicle_scd
+  - profile (demo profile linked to the radio id) Until oem owner profile is created
+  - profile (oem owner)
+  - trial subscription linked to device
+  - linked subscription (selfpay)
+  - current subscription
+- Change history should be created only if any of the fields value got changes from source tables
+When a new version is created, previous record should be updated with valid_to_est_timestamp same as new record valid_from_est_timestamp and is_current = false (not covered in this notebook)
+
+- Delta : Make sure to cover late arriving events for delta process
+  - since this table covers multiple source tables, having one delta process time may not work.  We had this issue in purchase/planswitch email data to SF.  Discuss with Vamshi / Werner for additional details.  (not covered in this notebook)
+  - make sure deleted events are covered .  (not covered in this notebook)
+----------------------------------------------
+
+    drop table if exists sandbox_prod.sbosco.vehicle_device_scd;
+create table sandbox_prod.sbosco.vehicle_device_scd
+select
+dvc.device_id,
+
+--device info
+dvc.vehicle_attribute_struct.radio_id,
+dvc.device_platform,
+
+--vehicle info
+veh.vehicle_id,
+veh.vehicle_type,
+veh.partner_name,
+veh.oem_owner_id,
+veh.automotive_struct.vin,
+veh.automotive_struct.make,
+veh.automotive_struct.model,
+veh.automotive_struct.year,
+veh.tesla_special_attribute_struct.delivery_state,
+veh.tesla_special_attribute_struct.vehicle_sale_type,
+veh.sale_country_code,
+
+--demo profile
+demo_prf.profile_id as demo_profile_id,
+demo_prf.language_code as demo_profile_language_code,
+
+--vehicle owner - driver profile
+driver_prf.profile_id as oem_owner_profile_id,
+driver_prf.language_code as oem_owner_profie_language_code,
+
+try_element_at( filter(veh.legal_terms_struct_array, x -> x.consentType = 'SXM Legal Terms and Conditions'), 1).acceptedAt as legal_terms_accept_est_timestamp,
+
+--device service status (change in order & change in legal terms clause)
+case when veh.tesla_special_attribute_struct.delivery_state = 'nonDelivered' then 'demo'
+     when legal_terms_accept_est_timestamp is null then 'trial_eligible'
+     when trial_sub.state in ('closed', 'cancelled', 'finished') and
+          trial_sub.linked_to_subscription_id is null then 'trial_expired'
+     when trial_sub.state not in ('closed', 'cancelled', 'finished') and legal_terms_accept_est_timestamp is not null then 'trial'
+     when current_sub.state not in  ('closed', 'cancelled', 'finished') then 'selfpay'
+     when current_sub.state in  ('closed', 'cancelled', 'finished') then 'end'
+     else 'unknown'
+end as device_service_status,
+
+
+
+/**** following fields should be populated only when delivery_state = 'delivered', else null - start **************/
+
+--we will have trial identity id as separate field
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     try_element_at( filter(trial_sub.beneficiary_id_array_struct, x -> x.type = 'identity'), 1).id 
+end as trial_identity_id, 
+
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     trial_sub.subscription_id 
+end as trial_subscription_id,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     trial_sub.subscription_timestamp_struct.start_est_timestamp 
+end as trial_subscription_start_est_timestamp,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     trial_sub.current_phase_struct.phase_end_est_timestamp 
+end as trial_subscription_end_est_timestamp,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+trial_sub.state 
+end as trial_subscription_state,
+
+
+/* changed to separate fields
+case when trial_sub.state in ('closed', 'cancelled', 'finished') and
+     trial_sub.linked_to_subscription is null then 'trial_expired'
+     when trial_sub.state in ('closed', 'cancelled', 'finished') and
+     trial_sub.linked_to_subscription is not null then 'followon'
+          when trial_identity_id is not null then 'streaming-claimed'
+          when trial_identity_id is null then 'anonymous'
+end as trial_state,
+*/
+
+-- new fieds
+case when trial_sub.linked_to_subscription_id is not null then true else false end as has_linked_to_subscription,
+case when trial_identity_id is null true else false end as is_anonymous_trial,
+
+
+--identity id - current sub, if not available, take trial sub identity
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     coalesce(current_sub.identity_id, trial_identity_id) 
+end as identity_id,
+
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     trial_sub.linked_to_subscription_id 
+end as linked_to_subscription_id,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     linked_sub.state 
+end as linked_to_subscription_state,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     linked_sub.source_timestamp_struct.create_est_timestamp 
+end as linked_to_subscription_create_est_timestamp,
+
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     current_sub.subscription_id 
+end as current_subscription_id,
+case when veh.tesla_special_attribute_struct.delivery_state = 'delivered' then
+     current_sub.state 
+end as current_subscription_state,
+/**** following fields should be populated only when delivery_state = 'delivered', else null - end **************/
+
+--new not covered in this notebook, but needed in prod
+/*
+prior_subscription_struct: prior subscription id (if we get an update with different subscription id. OR when device does not have any active sub, this field will indicate the last subscription on this device)
+prior_device_service_struct: prior device service status (if we get an update with different device service status), status_change_est_timestamp (to see when the status changed, for ex, from trial to demo)
+
+*/
+
+--valid from & to
+-- once driver profile exists, no need to track device profile
+least(veh.valid_from_est_timestamp, 
+      dvc.source_timestamp_struct.update_est_timestamp,
+      coalesce(driver_prf.source_timestamp_struct.update_est_timestamp,
+      demo_prf.source_timestamp_struct.update_est_timestamp),
+      current_sub.source_timestamp_struct.update_est_timestamp,
+      linked_sub.source_timestamp_struct.update_est_timestamp,
+      trial_sub.source_timestamp_struct.update_est_timestamp
+      )
+as valid_from_est_timestamp,
+cast('9999-12-31' as timestamp) as valid_to_est_timestamp,
+
+true as is_current
+
+
+from curated_prod.user.device_dim dvc
+left join sandbox_prod.sbosco.vehicle_scd veh
+on dvc.vehicle_attribute_struct.vehicle_id = veh.vehicle_id
+left join curated_prod.user.profile_dim demo_prf
+on demo_prf.device_id = dvc.device_id
+left join curated_prod.user.profile_dim driver_prf
+on driver_prf.oem_profile_id = veh.oem_owner_id
+left join curated_prod.commerce.subscription_snap trial_sub
+on trial_sub.snapshot_est_date = current_date - 1 -- latest snapshot date - mostly yesterday
+and trial_sub.device_id = dvc.device_id
+left join curated_prod.commerce.subscription_snap linked_sub
+on linked_sub.snapshot_est_date = current_date - 1 -- latest snapshot date - mostly yesterday
+and linked_sub.subscription_id = trial_sub.linked_to_subscription_id
+left join curated_prod.commerce.subscription_snap current_sub
+on current_sub.snapshot_est_date = current_date - 1  -- latest snapshot date - mostly yesterday
+and current_sub.identity_id = linked_sub.identity_id
+
+where veh.is_current = true
+qualify row_number() 
+over(partition by dvc.device_id
+order by 
+trial_sub.subscription_timestamp_struct.start_est_timestamp desc, --take the latest device trial 
+current_sub.subscription_timestamp_struct.start_est_timestamp desc -- take the latest sub for the identity
+) = 1
+--add delta extraction clauses for delta
+;
+select * from sandbox_prod.sbosco.vehicle_device_scd limit 100;
