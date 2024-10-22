@@ -1,0 +1,62 @@
+resources:
+  jobs:
+    vehicle_scd_curated_etl:
+      name: vehicle_scd_curated_etl
+      schedule:
+        quartz_cron_expression: 0 15 6 ? * * *
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: vehicle-scd
+          python_wheel_task:
+            package_name: curated_user
+            entry_point: vehicle_scd_etl
+            named_parameters:
+              config: >-
+                {
+                  "write": {
+                    "queryName": "{{task.name}}",
+                    "toTable": "curated_${var.env}.user.vehicle_scd",
+                    "targetTableUniqueKey": ["vehicle_id"],
+                    "targetTableOrderBy": ["valid_from_est_timestamp"]
+                  },
+                  "read": {
+                    "fromTables": {
+                    "vehicle_events": [
+                      "cleansed_${var.env}.user_services.vehicle_created_events",
+                      "cleansed_${var.env}.user_services.vehicle_updated_events",
+                      "cleansed_${var.env}.user_services.vehicle_deleted_events"
+                    ]
+                    },
+                    "sourcePartitionKey": ["vehicleId"],
+                    "orderBy": ["envelopeTime","kinesisApproximateArrivalTimestamp"],
+                    "jobMetadataLocation": "/Volumes/metadata_${var.env}/data_eng/non_streaming_metadata/curated_${var.env}/user/vehicle_scd"
+                  }
+                }
+          job_cluster_key: etl-cluster
+          libraries:
+            - whl: ../dist/curated_user*.whl
+            - whl: /Volumes/artifacts_${var.env}/data_eng/pypi/releases/data-eng-etl-lib/0.0.4/data_eng_etl_lib-0.0.4-py3-none-any.whl
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+            alert_on_last_attempt: true
+      job_clusters:
+        - job_cluster_key: etl-cluster
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+            aws_attributes:
+              first_on_demand: 2
+              availability: SPOT_WITH_FALLBACK
+              zone_id: auto
+              spot_bid_price_percent: 100
+            node_type_id: i3.xlarge
+            enable_elastic_disk: true
+            policy_id: ${var.cluster_policy_id}
+            data_security_mode: USER_ISOLATION
+            num_workers: 1
