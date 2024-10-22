@@ -1,0 +1,54 @@
+from enum import Enum
+from typing import Optional, Union
+
+from pydantic import BaseModel
+
+
+class LatestEventIntervalType(str, Enum):
+    DAY = "DAY"
+    HOUR = "HOUR"
+    EVENT = "EVENT"
+
+
+class ReadOptions(BaseModel, extra="allow"):
+    fromTables: Union[list[str], dict[str, list[str]]]
+    jobMetadataLocation: Optional[Union[str, None]] = None
+    eventTypeIdentifierColumn: Optional[str] = "envelopeType"
+    sourcePartitionKey: list[str]
+    orderBy: list[str]
+    createEntityPattern: Optional[str] = "Created"
+    deleteEntityPattern: Optional[str] = "Deleted"
+    eventTimestampCol: Optional[str] = "envelopeTime"
+    latestEventIntervalType: Optional[
+        LatestEventIntervalType
+    ] = LatestEventIntervalType.DAY
+
+
+class WriteOptions(BaseModel, extra="allow"):
+    toTable: str
+    targetTableUniqueKey: list[str]
+    targetTableOrderBy: Optional[list[str]] = [
+        "source_timestamp_struct.update_est_timestamp"
+    ]
+    checkpointLocation: Optional[str] = None
+    queryName: str
+    targetHashExcludeColumns: Optional[list[str]] = [
+        "valid_from_est_timestamp",
+        "valid_to_est_timestamp",
+        "is_current",
+        "etl_metadata_struct",
+    ]
+
+
+class SeqBackfillOptions(BaseModel, extra="allow"):
+    startDate: str
+    endDate: str
+
+
+class Config(BaseModel, extra="forbid"):
+    read: ReadOptions
+    write: WriteOptions
+
+
+class Scd2BackfillConfig(Config, extra="forbid"):
+    seqBackfillOptions: SeqBackfillOptions
