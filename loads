@@ -1,0 +1,97 @@
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
+
+from curated_user.config import Config
+
+
+def write_scd1_merge(
+    spark: SparkSession,
+    source_df: DataFrame,
+    config: Config,
+    delete_enabled_flag: bool = True,
+) -> None:
+    target_table = DeltaTable.forName(spark, config.write.toTable)
+    join_condition = " and ".join(
+        [f"s.{col} == t.{col}" for col in config.write.targetTableUniqueKey]
+    )
+    update_columns_list = [
+        col
+        for col in target_table.toDF().columns
+        if col
+        not in [
+            "etl_metadata_struct",
+        ]
+    ] + ["etl_metadata_struct.etl_update_est_timestamp"]
+    update_columns_map = {col: f"s.{col}" for col in update_columns_list}
+    insert_columns_map = {col: f"s.{col}" for col in target_table.toDF().columns}
+    merge_insert_condition = f"s.{config.read.eventTypeIdentifierColumn}  \
+                             not like '%{config.read.deleteEntityPattern}%' \
+                             or s.{config.read.eventTypeIdentifierColumn} is null"
+    merge_delete_condition = f"{config.read.eventTypeIdentifierColumn} like '%{config.read.deleteEntityPattern}%'"
+
+    merge_to_target_table = target_table.alias("t").merge(
+        source_df.alias("s"), join_condition
+    )
+
+    if delete_enabled_flag:
+        merge_to_target_table = (
+            merge_to_target_table.whenMatchedDelete(
+                condition=merge_delete_condition,
+            )
+            .whenMatchedUpdate(
+                set=update_columns_map,
+            )
+            .whenNotMatchedInsert(
+                condition=merge_insert_condition,
+                values=insert_columns_map,
+            )
+        )
+    else:
+        merge_to_target_table = merge_to_target_table.whenMatchedUpdate(
+            set=update_columns_map,
+        ).whenNotMatchedInsert(
+            values=insert_columns_map,
+        )
+
+    merge_to_target_table.execute()
+
+
+def write_scd2_merge_all_events(
+    spark: SparkSession, df: DataFrame, config: Config
+) -> None:
+    """
+    Writes the dataframe to the table for scd type 2.  This process does a merge
+    to keep historic events.  Events that are superseded by a later event are deprecated
+    by updating the valid_to_est_timestamp to the valid_from_est_timestamp (effectively) of the newer event.
+    Newest events are inserted into the table
+    This function expects all the events in the input DataFrame to be in the SCD type2 format with
+    valid_from_est_timestamp, valid_to_est_timestamp and is_current populated as per biz requiremnt. Current
+    "scd2_ordered_events" takes takes of this task & its a prerquisite for this function.
+
+    Args:
+        spark (SparkSession): the spark session
+        df (dataframe): the dataframe with the incremental data to write to the table
+        config (Config): the job configuration object with relevant job parameters
+    Returns: None
+    """
+
+    target_table = DeltaTable.forName(spark, config.write.toTable)
+
+    merge_join_condition = " and ".join(
+        [
+            f"target.{i} = source.{i}"
+            for i in config.write.targetTableUniqueKey + ["valid_from_est_timestamp"]
+        ]
+    )
+
+    target_table.alias("target").merge(
+        df.alias("source"),
+        merge_join_condition,
+    ).whenMatchedUpdate(
+        condition="target.is_current = true and source.is_current = false ",
+        set={
+            "is_current": "false",
+            "valid_to_est_timestamp": "source.valid_to_est_timestamp",
+            "etl_metadata_struct.etl_update_est_timestamp": "from_utc_timestamp(current_timestamp(), 'UTC-5')",
+        },
+    ).whenNotMatchedInsertAll().execute()
