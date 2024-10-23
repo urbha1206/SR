@@ -1,42 +1,49 @@
 resources:
   jobs:
-    vehicle_scd_curated_etl:
-      name: vehicle_scd_curated_etl
+    vehicle_device_scd_curated_etl:
+      name: vehicle_device_scd_curated_etl
       schedule:
         quartz_cron_expression: 0 15 6 ? * * *
         timezone_id: UTC
         pause_status: PAUSED
       tasks:
-        - task_key: vehicle-scd
+        - task_key: vehicle-device-scd
           python_wheel_task:
             package_name: curated_user
-            entry_point: vehicle_scd_etl
+            entry_point: vehicle_device_scd_etl
             named_parameters:
               config: >-
                 {
                   "write": {
                     "queryName": "{{task.name}}",
-                    "toTable": "curated_${var.env}.user.vehicle_scd",
-                    "targetTableUniqueKey": ["vehicle_id"],
+                    "toTable": "curated_${var.env}.user.vehicle_device_scd",
+                    "targetTableUniqueKey": ["device_id"],
                     "targetTableOrderBy": ["valid_from_est_timestamp"]
                   },
                   "read": {
                     "fromTables": {
-                    "vehicle_events": [
-                      "cleansed_${var.env}.user_services.vehicle_created_events",
-                      "cleansed_${var.env}.user_services.vehicle_updated_events",
-                      "cleansed_${var.env}.user_services.vehicle_deleted_events"
-                    ]
+                    "device_dim": [
+                      "curated_${var.env}.user.device_dim"
+                      ],
+                    "vehicle_scd": [
+                      "curated_${var.env}.user.vehicle_scd"
+                      ],
+                    "profile_dim": [
+                      "curated_${var.env}.user.profile_dim"
+                      ],
+                    "subscription_snap": [
+                      "curated_${var.env}.commerce.subscription_snap"
+                      ]
                     },
-                    "sourcePartitionKey": ["vehicleId"],
-                    "orderBy": ["envelopeTime","kinesisApproximateArrivalTimestamp"],
-                    "jobMetadataLocation": "/Volumes/metadata_${var.env}/data_eng/non_streaming_metadata/curated_${var.env}/user/vehicle_scd"
+                    "sourcePartitionKey": ["device_id"],
+                    "orderBy": ["valid_from_est_timestamp"],
+                    "jobMetadataLocation": "/Volumes/metadata_${var.env}/data_eng/non_streaming_metadata/curated_${var.env}/user/vehicle_device_scd"
                   }
                 }
           job_cluster_key: etl-cluster
           libraries:
             - whl: ../dist/curated_user*.whl
-            - whl: /Volumes/artifacts_${var.env}/data_eng/pypi/releases/data-eng-etl-lib/0.0.4/data_eng_etl_lib-0.0.4-py3-none-any.whl
+            - whl: /Volumes/artifacts_${var.env}/data_eng/pypi/releases/data-eng-etl-lib/0.0.3/data_eng_etl_lib-0.0.3-py3-none-any.whl
           email_notifications:
             on_failure:
               - ${var.alert_email}
