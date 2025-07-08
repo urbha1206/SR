@@ -1,0 +1,434 @@
+1) 
+
+SELECT
+cast(cast(pc.start_exec_ts AS date) AS TEXT) FROM_DATE,
+COALESCE (cast(cast(PC.end_exec_ts AS date) as text), cast(CAST(BA.BATCH_START_TS AS date)as text)) TO_DATEE
+FROM
+edw_ods.process_control PC JOIN edw_ods.batch_audit BA
+ON PC.subject_area_id=BA.subject_area_id
+WHERE
+PC.subject_area_id = (SELECT SUBJECT_AREA_ID FROM edw_ods.integration_config WHERE UPPER(DEPT_NM)='SUBSCRIBERMANAGEMENT' AND 
+UPPER(DIVISION_NM)='TRIAL' AND UPPER(SUBJECT_AREA_NM)='FACT_TRIAL_FEATURE')
+AND UPPER(PROCESS_STATUS_CD)='IN PROGRESS';
+
+2)
+
+SELECT 
+TRIAL_FEAT_KEY,
+TRIAL_FEAT_PREV_KEY,
+SBSCR_LIFCYC_KEY,
+TRIAL_ID,
+FEAT_ID,
+CHG_DT_STRT,
+CHG_DT_END,
+TRIAL_STS,
+EARLY_DEACT_FL,
+DEAVTN_RSN_CD,
+TRIAL_STRT_DT,
+TRIAL_SPILLOVR_STRT_DT,
+RPRTD_TRIAL_STRT_DT,
+ACTL_TRIAL_END_DT,
+TRIAL_END_DT,
+TRIAL_MATURITY_DT,
+TRIAL_MATURITY_YRMON,
+TRIAL_MATURITY_MONNAMYR,
+DVC_ID,
+DVC_ID_ACTL,
+DVC_REC_KEY,
+TRIAL_PROD_ID,
+TRIAL_PROD_KEY,
+TRIAL_PLAN_ID,
+TRIAL_PLAN_KEY,
+TRIAL_AGN_ID,
+AGN_REC_KEY,
+TRIAL_PROM_CD,
+TRIAL_DUR_IN_DAYS,
+TRIAL_DUR_IN_MO,
+PLAN_CNT_AS_SUB,
+PKG_ID,
+CHNL_REC_KEY,
+EQMNT_KEY,
+GEOMKT_REC_KEY,
+ACCT_ID,
+ACCT_REC_KEY,
+PARNT_ACCT_REC_KEY,
+SRVC_ID,
+SRVC_ID_ACTL,
+SLD_STKEY,
+VIN,
+PTNR_ID,
+CROS_REC_KEY,
+CONV_SRC_REC_KEY,
+Purchase_Type_ID,
+trial_type_ID,
+VEH_TRIAL_PRG,
+TRIAL_PRG_KEY,
+OT2_REC_KEY,
+SUBSQ_OWN_FL,
+VEH_AGE_IN_DAYS,
+VEH_AGE_IN_YRS,
+TRIAL_STRT_DELAY_PER,
+RPRTD_TRIAL_STRT_DELAY_PER,
+VEH_REC_KEY,
+PRTY_ID,
+PRTY_KEY,
+FST_PRTY_ID,
+FST_PRTY_KEY,
+HHLD_ID,
+HHLD_KEY,
+FST_HHLD_ID,
+FST_HHLD_KEY,
+STRGH_TO_SLFPAY_FL,
+COMBO_TRIAL_FL,
+OPP_FL,
+OPP_IN,
+OPP_FALLOFF_REC_KEY,
+TRIAL_RSULT_REC_KEY,
+SLFPAY_PRCH_FL,
+CONV_PRCH_DT,
+DAYS_TO_CONV,
+FOLOWON_FL,
+FOLOWON_PROD_ID,
+FOLOWON_PROD_KEY,
+FOLOWON_PRCH_DT,
+FOLOWON_PLAN_ID,
+FOLOWON_PLAN_KEY,
+FOLOWON_AGN_ID,
+FOLOWON_AGN_REC_KEY,
+CONV_FL,
+SUB_CONV_FL,
+CONV_DT,
+CONV_PROD_ID,
+CONV_PROD_KEY,
+CONV_PROMCD,
+CONV_AGN_ID,
+CONV_AGN_REC_KEY,
+CONV_PLAN_ID,
+CONV_PLAN_KEY,
+CONV_PRTY_ID,
+CONV_PRTY_KEY,
+CONV_HHLD_ID,
+CONV_HHLD_KEY,
+CONV_PKG_ID,
+CONV_TM_REC_KEY,
+CONV_SLD_STKEY,
+CONV_APS_REC_ID,
+MAN_ADJ_FL,
+MAN_ADJ_FL_DT,
+MAN_ADJ_FL_DSC,
+REST_FL,
+REST_TRIAL_ID,
+PRIOR_RL_ID_STRT,
+PRIOR_RL_ID_MAT,
+feature_conversion_flag,
+TRIAL_OFR_ID,
+FOLOWON_OFR_ID,
+CONV_OFR_ID,
+UPDT_TS,
+INSE_TS,
+is_curr_srvc_prtbl_ind,
+prtd_srvc_deactvtd_sbscrptn_id,
+prtd_srvc_deactvtd_device_id
+FROM DP_VEDW_SRC_TLD.FACT_TRIAL_FEATURE
+WHERE 
+--~WhereClause~
+--((ChangeDateStart >= '2019-05-06' and ChangeDateStart <= '2019-05-06' ) OR (ChangeDateEnd between '2019-05-05' and '2019-05-06'))
+"+context.Cur_WhereClause
+
+3)  call edo_admin.sp_truncate_tbl('edw_datamart_stg', 'stg_fact_trial_feature');
+
+4)
+
+COPY  EDW_DATAMART_STG.STG_FACT_TRIAL_FEATURE
+from 's3://"+((String)globalMap.get("tS3List_1_CURRENT_BUCKET"))+"/"+((String)globalMap.get("tS3List_1_CURRENT_KEY"))+"' 
+credentials 'aws_iam_role="+context.s3_redshift_role+"'
+CSV
+delimiter '|' region 'us-east-1' 
+IGNOREHEADER 1 
+EMPTYASNULL 
+timeformat 'YYYY-MM-DD HH:MI:SS'
+dateformat 'DD-MM-YYYY'
+QUOTE '\"';
+
+5)
+
+"
+-- Update REC_EXP_TS for existing rows
+
+UPDATE EDW_DATAMART.FACT_TRIAL_FEATURE TGT
+SET REC_EXP_TS = STG.REC_EFF_TS-1, IS_LATEST_REC_IND = 'N'
+FROM EDW_DATAMART_STG.STG_FACT_TRIAL_FEATURE STG
+WHERE 
+TGT.TRIAL_ID=STG.TRIAL_ID
+AND TGT.FTRE_CD=STG.FEAT_ID
+AND TGT.REC_EXP_TS ='2999-12-31';
+
+-- New rows
+
+INSERT INTO EDW_DATAMART.FACT_TRIAL_FEATURE 
+(
+TRIAL_FTRE_KEY_ID,
+SBSCRPTN_LIFCYCL_KEY_ID,
+REC_EFF_TS,
+REC_EXP_TS,
+PREV_TRIAL_FTRE_KEY_ID,
+SBSCRPTN_KEY_ID,
+SBSCRPTN_ID,
+TRIAL_ID,
+FTRE_CD,
+TRIAL_STS_CD,
+IS_EARLY_DACTVN_IND,
+DACTVN_RSN_CD,
+TRIAL_START_DT,
+TRIAL_SPILLOVR_START_DT,
+RPTD_TRIAL_START_DT,
+ACTL_TRIAL_END_DT,
+TRIAL_END_DT,
+TRIAL_MATURITY_DT,
+DEVICE_KEY_ID,
+DEVICE_ID,
+LOGIN_ID,
+EQPMNT_ID,
+PRTNR_KEY_ID,
+PRTNR_ID,
+VEH_GRP_ID,
+OWNER_TYPE_ID,
+ACCT_KEY_ID,
+ACCT_NBR,
+PRNT_ACCT_KEY_ID,
+PRNT_ACCT_NBR,
+PARTY_KEY_ID,
+AGILITY_PARTY_ID,
+TRIAL_START_PARTY_KEY_ID,
+TRIAL_START_AGILITY_PARTY_ID,
+HHLD_KEY_ID,
+HHLD_ID,
+TRIAL_START_HHLD_KEY_ID,
+TRIAL_START_HHLD_ID,
+GEOMKT_KEY_ID,
+TRIAL_OFR_KEY_ID,
+TRIAL_OFR_ID,
+PKG_ID,
+TRIAL_PLAN_KEY_ID,
+TRIAL_PLAN_ID,
+TRIAL_PRDCT_KEY_ID,
+TRIAL_PRDCT_ID,
+TRIAL_AGENT_KEY_ID,
+TRIAL_CSR_ID,
+TRIAL_AGENT_ID,
+TRIAL_PROMO_CD,
+TRIAL_DURN_DAY_QTY,
+TRIAL_DURN_MONTH_QTY,
+IS_COUNT_AS_SBSCRPTN_IND,
+SRVC_KEY_ID,
+SRVC_ID,
+ACTL_SRVC_KEY_ID,
+ACTL_SRVC_ID,
+DEVICE_LIFCYCL_ID,
+VEH_AGE_DAY_QTY,
+VEH_AGE_YEAR_QTY,
+TRIAL_STRT_DLY_PRD_QTY,
+RPTD_TRIAL_START_DLY_PRD_QTY,
+IS_STRAIGHT_TO_SELFPAY_IND,
+IS_COMBO_TRIAL_IND,
+IS_OPRTNTY_IND,
+OPRTNTY_FALLOFF_RSN_CD,
+TRIAL_RSLT_CD,
+IS_SELFPAY_PRCH_IND,
+CONV_PRCH_DT,
+DAYS_TO_CONV_QTY,
+IS_FOLWON_IND,
+FOLWON_OFR_KEY_ID,
+FOLWON_OFR_ID,
+FOLWON_PKG_ID,
+FOLWON_PLAN_KEY_ID,
+FOLWON_PLAN_ID,
+FOLWON_PRDCT_KEY_ID,
+FOLWON_PRDCT_ID,
+FOLWON_AGENT_KEY_ID,
+FOLWON_CSR_ID,
+FOLWON_AGENT_ID,
+FOLWON_PRCH_DT,
+IS_CONV_IND,
+IS_SUB_CONV_IND,
+CONV_DT,
+CONV_PARTY_KEY_ID,
+CONV_AGILITY_PARTY_ID,
+CONV_HHLD_KEY_ID,
+CONV_HHLD_ID,
+CONV_OFR_KEY_ID,
+CONV_OFR_ID,
+CONV_PACKAGE_ID,
+CONV_PLAN_KEY_ID,
+CONV_PLAN_ID,
+CONV_PRDCT_ID,
+CONV_PRDCT_KEY_ID,
+CONV_AGENT_KEY_ID,
+CONV_CSR_ID,
+CONV_AGENT_ID,
+CONV_PROMO_CD,
+CONV_TMLNS_CD,
+CONV_DEVICE_LIFCYCL_ID,
+CONV_PRCH_ID,
+IS_MNUL_ADJSTMNT_IND,
+MNUL_ADJSTMNT_DT,
+MNUL_ADJSTMNT_DESC,
+IS_RSTRT_IND,
+RSTRT_TRIAL_ID,
+PRIOR_RLTN_START_ID,
+PRIOR_RLTN_MATURITY_ID,
+TRIAL_FTRE_QTY,
+IS_LATEST_REC_IND,
+CREATE_TS,
+UPDATE_TS,
+is_curr_srvc_prtbl_ind,
+prtd_srvc_deactvtd_sbscrptn_id,
+prtd_srvc_deactvtd_device_id
+)
+SELECT
+coalesce(cast(NULLIF(trim(STG.TRIAL_FEAT_KEY),'') as bigint),-2) as TRIAL_FTRE_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.SBSCR_LIFCYC_KEY),'') as bigint), -2) as SBSCRPTN_LIFCYCL_KEY_ID,
+coalesce(to_date(nullif(trim(STG.rec_eff_ts), ''),'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD')  ) as REC_EFF_TS,
+coalesce(to_date(nullif(trim(STG.rec_exp_ts), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as REC_EXP_TS,
+coalesce(cast(NULLIF(trim(STG.TRIAL_FEAT_PREV_KEY),'') as bigint),-2) as PREV_TRIAL_FTRE_KEY_ID,
+-1 as SBSCRPTN_KEY_ID,
+coalesce(cast(trim(ds2.sms_sbscrptn_id) as varchar),'N/A') as SBSCRPTN_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_ID),'') as bigint),-2) as TRIAL_ID,
+coalesce(cast(trim(STG.FEAT_ID) as varchar),'N/A') as FTRE_CD,
+coalesce(trim(STG.TRIAL_STS),'N/A') as TRIAL_STS_CD,
+coalesce(cast(trim(STG.EARLY_DEACT_FL) as varchar),'N/A') as IS_EARLY_DACTVN_IND,
+coalesce(cast(trim(STG.DEAVTN_RSN_CD) as varchar),'N/A') as DACTVN_RSN_CD,
+coalesce(to_date(nullif(trim(STG.TRIAL_STRT_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as TRIAL_START_DT,
+coalesce(to_date(nullif(trim(STG.TRIAL_SPILLOVR_STRT_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as TRIAL_SPILLOVR_START_DT,
+coalesce(to_date(nullif(trim(STG.RPRTD_TRIAL_STRT_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as RPTD_TRIAL_START_DT,
+coalesce(to_date(nullif(trim(STG.ACTL_TRIAL_END_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as ACTL_TRIAL_END_DT,
+coalesce(to_date(nullif(trim(STG.TRIAL_END_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as TRIAL_END_DT,
+coalesce(to_date(nullif(trim(STG.TRIAL_MATURITY_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as TRIAL_MATURITY_DT,
+coalesce(cast(NULLIF(trim(STG.DVC_REC_KEY),'') as bigint),-2) as DEVICE_KEY_ID,
+case when FEAT_ID=7 then 
+        case when trim(stg.srvc_id)=trim(stg.srvc_id_actl) then 'N/A'
+                else case when len(trim(dvc_id)) in (8,10,12) then trim(dvc_id)
+                        else 'N/A'
+                        end
+        end
+else trim(dvc_id)
+end as DEVICE_ID,
+case when FEAT_ID=7 then coalesce(NULLIF(trim(STG.dvc_id_actl),''),'N/A')
+         else 'N/A' 
+end as LOGIN_ID,
+coalesce(cast(NULLIF(trim(STG.EQMNT_KEY),'') as Decimal),-2) as EQPMNT_ID,
+coalesce(cast(NULLIF(trim(STG.CHNL_REC_KEY),'') as bigint),-2) as PRTNR_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.PTNR_ID),'') as int),-2) as PRTNR_ID,
+coalesce(cast(NULLIF(trim(STG.VEH_REC_KEY),'') as bigint),-2) as VEH_GRP_ID,
+coalesce(cast(NULLIF(trim(STG.OT2_REC_KEY),'') as bigint),-2) as OWNER_TYPE_ID,
+coalesce(cast(NULLIF(trim(STG.ACCT_REC_KEY),'') as bigint),-2) as ACCT_KEY_ID,
+coalesce(cast(trim(STG.ACCT_ID) as varchar),'N/A') as ACCT_NBR,
+coalesce(cast(NULLIF(trim(STG.PARNT_ACCT_REC_KEY),'') as bigint),-2) as PRNT_ACCT_KEY_ID,
+coalesce(trim(da.prnt_acct_nbr),'N/A') as PRNT_ACCT_NBR,
+coalesce(cast(NULLIF(trim(STG.PRTY_KEY),'') as bigint),-2) as PARTY_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.PRTY_ID),'') as bigint),-2) as AGILITY_PARTY_ID,
+coalesce(cast(NULLIF(trim(STG.FST_PRTY_KEY),'') as bigint),-2) as TRIAL_START_PARTY_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.FST_PRTY_ID),'') as bigint),-2) as TRIAL_START_AGILITY_PARTY_ID,
+coalesce(cast(NULLIF(trim(STG.HHLD_KEY),'') as bigint),-2) as HHLD_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.HHLD_ID),'') as bigint),-2) as HHLD_ID,
+coalesce(cast(NULLIF(trim(STG.FST_HHLD_KEY),'') as bigint),-2) as TRIAL_START_HHLD_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.FST_HHLD_ID),'') as bigint),-2) as TRIAL_START_HHLD_ID,
+coalesce(cast(NULLIF(trim(STG.GEOMKT_REC_KEY),'') as int),-2) as GEOMKT_KEY_ID,
+coalesce(cast(NULLIF(trim(TRIAL_OFR.ofr_key_id),'') as int),-2) as TRIAL_OFR_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_OFR_ID),'') as int),-2) as TRIAL_OFR_ID,
+coalesce(trim(STG.PKG_ID),'N/A') as PKG_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_PLAN_KEY),'') as bigint),-2) as TRIAL_PLAN_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_PLAN_ID),'') as bigint),-2) as TRIAL_PLAN_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_PROD_KEY),'') as bigint),-2) as TRIAL_PRDCT_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_PROD_ID),'') as bigint),-2) as TRIAL_PRDCT_ID,
+coalesce(cast(NULLIF(trim(STG.AGN_REC_KEY),'') as bigint),-2) as TRIAL_AGENT_KEY_ID,
+coalesce(trim(TRIAL_CSR.csr_id),'N/A') as TRIAL_CSR_ID,
+coalesce(cast(NULLIF(trim(STG.TRIAL_AGN_ID),'') as bigint),-2) as TRIAL_AGENT_ID,
+coalesce(trim(STG.TRIAL_PROM_CD),'N/A') as TRIAL_PROMO_CD,
+coalesce(cast(NULLIF(trim(STG.TRIAL_DUR_IN_DAYS),'') as int),-2) as TRIAL_DURN_DAY_QTY,
+coalesce(cast(NULLIF(trim(STG.TRIAL_DUR_IN_MO),'') as int),-2) as TRIAL_DURN_MONTH_QTY,
+coalesce(trim(STG.PLAN_CNT_AS_SUB),'N/A') as IS_COUNT_AS_SBSCRPTN_IND,
+coalesce(cast(NULLIF(trim(ds1.srvc_key_id),'') as bigint), -2) as SRVC_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.SRVC_ID),'') as bigint), -2) as SRVC_ID,
+coalesce(cast(NULLIF(trim(ds2.srvc_key_id),'') as bigint), -2) as ACTL_SRVC_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.SRVC_ID_ACTL),'') as bigint), -2) as ACTL_SRVC_ID,
+coalesce(cast(NULLIF(trim(STG.SLD_STKEY),'') as bigint),-2) as DEVICE_LIFCYCL_ID,
+coalesce(cast(NULLIF(trim(STG.VEH_AGE_IN_DAYS),'') as int),-2) as VEH_AGE_DAY_QTY,
+coalesce(cast(NULLIF(trim(STG.VEH_AGE_IN_YRS),'') as int),-2) as VEH_AGE_YEAR_QTY,
+coalesce(cast(NULLIF(trim(STG.TRIAL_STRT_DELAY_PER),'') as int),-2) as TRIAL_STRT_DLY_PRD_QTY,
+coalesce(cast(NULLIF(trim(STG.RPRTD_TRIAL_STRT_DELAY_PER),'') as int),-2) as RPTD_TRIAL_START_DLY_PRD_QTY,
+coalesce(trim(STG.STRGH_TO_SLFPAY_FL),'N/A') as IS_STRAIGHT_TO_SELFPAY_IND,
+coalesce(trim(STG.COMBO_TRIAL_FL),'N/A') as IS_COMBO_TRIAL_IND,
+coalesce(cast(trim(STG.OPP_FL) as varchar),'N/A') as IS_OPRTNTY_IND,
+coalesce(trim(vofr.oprtnty_falloff_rsn_cd),'N/A') as OPRTNTY_FALLOFF_RSN_CD,
+coalesce(cast(trim(STG.TRIAL_RSULT_REC_KEY) as varchar),'N/A') as TRIAL_RSLT_CD,
+coalesce(cast(trim(STG.SLFPAY_PRCH_FL) as varchar),'N/A') as IS_SELFPAY_PRCH_IND,
+coalesce(to_date(nullif(trim(STG.CONV_PRCH_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as CONV_PRCH_DT,
+coalesce(cast(NULLIF(trim(STG.DAYS_TO_CONV),'') as int),-2) as DAYS_TO_CONV_QTY,
+coalesce(cast(trim(STG.FOLOWON_FL) as varchar),'N/A') as IS_FOLWON_IND,
+coalesce(cast(NULLIF(trim(FOLWON_OFR.ofr_key_id),'') as int),-2) as FOLWON_OFR_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_OFR_ID),'') as bigint),-2) as FOLWON_OFR_ID,
+coalesce(trim(FOLWON_OFR.OFR_PKG_ID),'N/A') AS FOLWON_PKG_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_PLAN_KEY),'') as bigint),-2) as FOLWON_PLAN_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_PLAN_ID),'') as bigint),-2) as FOLWON_PLAN_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_PROD_KEY),'') as bigint),-2) as FOLWON_PRDCT_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_PROD_ID),'') as bigint),-2) as FOLWON_PRDCT_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_AGN_REC_KEY),'') as bigint),-2) as FOLWON_AGENT_KEY_ID,
+coalesce(trim(FOLWON_CSR.csr_id),'N/A') AS FOLWON_CSR_ID,
+coalesce(cast(NULLIF(trim(STG.FOLOWON_AGN_ID),'') as bigint),-2) as FOLWON_AGENT_ID,
+coalesce(to_date(nullif(trim(STG.FOLOWON_PRCH_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as FOLWON_PRCH_DT,
+coalesce(cast(trim(STG.CONV_FL) as varchar),'N/A') as IS_CONV_IND,
+coalesce(cast(trim(STG.SUB_CONV_FL) as varchar),'N/A') as IS_SUB_CONV_IND,
+coalesce(to_date(nullif(trim(STG.CONV_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as CONV_DT,
+coalesce(cast(NULLIF(trim(STG.CONV_PRTY_KEY),'') as bigint),-2) as CONV_PARTY_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_PRTY_ID),'') as bigint),-2) as CONV_AGILITY_PARTY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_HHLD_KEY),'') as bigint),-2) as CONV_HHLD_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_HHLD_ID),'') as bigint),-2) as CONV_HHLD_ID,
+coalesce(cast(NULLIF(trim(CONV_OFR.ofr_key_id),'') as int),-2) as CONV_OFR_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_OFR_ID),'') as bigint),-2) as CONV_OFR_ID,
+coalesce(trim(STG.CONV_PKG_ID),'N/A') as CONV_PACKAGE_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_PLAN_KEY),'') as bigint),-2) as CONV_PLAN_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_PLAN_ID),'') as bigint),-2) as CONV_PLAN_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_PROD_ID),'') as bigint),-2) as CONV_PRDCT_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_PROD_KEY),'') as bigint),-2) as CONV_PRDCT_KEY_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_AGN_REC_KEY),'') as bigint),-2) as CONV_AGENT_KEY_ID,
+coalesce(trim(CONV_CSR.csr_id),'N/A') AS CONV_CSR_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_AGN_ID),'') as bigint),-2) as CONV_AGENT_ID,
+coalesce(trim(STG.CONV_PROMCD),'N/A') as CONV_PROMO_CD,
+coalesce(cast(trim(STG.CONV_TM_REC_KEY) as varchar),'N/A') as CONV_TMLNS_CD,
+coalesce(cast(NULLIF(trim(STG.CONV_SLD_STKEY),'') as bigint),-2) as CONV_DEVICE_LIFCYCL_ID,
+coalesce(cast(NULLIF(trim(STG.CONV_APS_REC_ID),'') as bigint),-2) as CONV_PRCH_ID,
+coalesce(cast(trim(STG.MAN_ADJ_FL) as varchar),'N/A') as IS_MNUL_ADJSTMNT_IND,
+coalesce(to_date(nullif(trim(STG.MAN_ADJ_FL_DT), ''), 'YYYY-MM-DD'),to_date('1970/01/01','YYYY-MM-DD') ) as MNUL_ADJSTMNT_DT,
+coalesce(trim(STG.MAN_ADJ_FL_DSC),'N/A') as MNUL_ADJSTMNT_DESC,
+coalesce(cast(trim(STG.REST_FL) as varchar),'N/A') as IS_RSTRT_IND,
+coalesce(cast(NULLIF(trim(STG.REST_TRIAL_ID),'') as bigint), -2) as RSTRT_TRIAL_ID,
+coalesce(cast(NULLIF(trim(STG.PRIOR_RL_ID_STRT),'') as int),-2) as PRIOR_RLTN_START_ID,
+coalesce(cast(NULLIF(trim(STG.PRIOR_RL_ID_MAT),'') as int),-2) as PRIOR_RLTN_MATURITY_ID,
+1 as TRIAL_FTRE_QTY,
+'Y' as IS_LATEST_REC_IND,
+sysdate as CREATE_TS,
+sysdate as UPDATE_TS,
+is_curr_srvc_prtbl_ind,
+prtd_srvc_deactvtd_sbscrptn_id,
+prtd_srvc_deactvtd_device_id
+FROM EDW_DATAMART_STG.STG_FACT_TRIAL_FEATURE STG
+LEFT OUTER JOIN edw_datamart.dim_account da on (STG.ACCT_REC_KEY = da.acct_key_id )
+LEFT OUTER JOIN edw_datamart.dim_service ds1 on  (STG.SRVC_ID = ds1.srvc_id) 
+and STG.dvc_id = ds1.device_id AND STG.rec_eff_ts between ds1.rec_eff_ts and ds1.rec_exp_ts
+LEFT OUTER JOIN edw_datamart.dim_service ds2 on  (STG.SRVC_ID_ACTL = ds2.srvc_id)
+and STG.dvc_id_actl = ds2.device_id  AND stg.rec_eff_ts between ds2.rec_eff_ts and ds2.rec_exp_ts
+LEFT OUTER JOIN edw_datamart.dim_agent TRIAL_CSR on (STG.AGN_REC_KEY = TRIAL_CSR.agent_key_id) 
+LEFT OUTER JOIN edw_datamart.dim_agent FOLWON_CSR on (STG.FOLOWON_AGN_REC_KEY = FOLWON_CSR.agent_key_id) 
+LEFT OUTER JOIN edw_datamart.dim_offer TRIAL_OFR on (STG.TRIAL_OFR_ID = TRIAL_OFR.ofr_id) 
+And TRIAL_OFR.rec_exp_ts = '2999-12-31' 
+LEFT OUTER JOIN edw_datamart.dim_offer FOLWON_OFR on (STG.FOLOWON_OFR_ID = FOLWON_OFR.ofr_id) 
+And FOLWON_OFR.rec_exp_ts = '2999-12-31' 
+LEFT OUTER JOIN edw_datamart.dim_offer CONV_OFR on (STG.CONV_OFR_ID = CONV_OFR.ofr_id) 
+And CONV_OFR.rec_exp_ts = '2999-12-31' 
+LEFT OUTER JOIN edw_datamart.dim_agent CONV_CSR on (STG.CONV_AGN_REC_KEY = CONV_CSR.agent_key_id) 
+LEFT OUTER JOIN  EDW_ODS.V_OPPORTUNITY_FALLOFF_REASON vofr on (STG.OPP_IN = vofr.oprtnty_falloff_rsn_nm)
+WHERE NOT EXISTS (SELECT 1 FROM EDW_DATAMART.FACT_TRIAL_FEATURE TGT WHERE STG.TRIAL_FEAT_KEY= TGT.TRIAL_FTRE_KEY_ID);
+
+"
+
