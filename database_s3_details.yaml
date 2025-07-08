@@ -1,0 +1,19 @@
+database_connectivity_details:
+  td_host: "/edo/dev/teradata/host"
+  td_username: "/edo/dev/teradata/cod/user"
+  td_password: "/edo/dev/teradata/cod/password"
+  dbname: "dev"
+  rshft_host: "/edo/dev/redshift/host"
+  rshft_username: "/edo/dev/redshift/datamart/user"
+  rshft_password: "/edo/dev/redshift/datamart/password"
+  rshft_port: "/edo/dev/redshift/port"
+  aurora_host: "/edo/dev/ods_aurora/host"
+  aurora_username: "/edo/dev/ods_aurora/edw_ods/user"
+  aurora_password: "/edo/dev/ods_aurora/edw_ods/pwd"
+  aurora_dbname: "postgres"
+  aurora_port: "5432"
+
+s3_bucket_details:
+  bucket_nm: "sxm-edo-dev"
+  s3_copy_path: "datalake/transient/SupplyChain/Datamart/Dimension/dim_agent/"
+  iam_role: "arn:aws:iam::308904643607:role/RedShiftAdmin-dev"
